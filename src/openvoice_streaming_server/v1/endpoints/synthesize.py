@@ -80,15 +80,16 @@ class WebSocketHandler:
 
 
 en_checkpoint_base = "../resources/checkpoints/base_speakers/EN"
+converter_checkpoint = "../resources/checkpoints/converter"
 device = "cuda:0" if torch.cuda.is_available() else "cpu"
 
 # Load models and resources
 clone_model = StreamingCloneSpeakerTTS(
-    f"{en_checkpoint_base}/config.json", device=device
+    f"{converter_checkpoint}/config.json", device=device
 )
 model = StreamingBaseSpeakerTTS(f"{en_checkpoint_base}/config.json", device=device)
 model.load_ckpt(f"{en_checkpoint_base}/checkpoint.pth")
-clone_model.load_ckpt(f"{en_checkpoint_base}/checkpoint.pth")
+clone_model.load_ckpt(f"{converter_checkpoint}/checkpoint.pth")
 
 handler = WebSocketHandler(model, clone_model)
 
