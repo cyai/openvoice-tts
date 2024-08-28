@@ -73,9 +73,7 @@ class WebSocketHandler:
                     f"Received text: {text}, speaker: {speaker}, language: {language}, speed: {speed}"
                 )
 
-                cloned_audio_stream = self.clone_model.tts_stream(
-                    text, speaker, language, speed
-                )
+                audio_stream = self.model.tts_stream(text, speaker, language, speed)
                 # async for audio_chunk in self.model.generate_audio_chunks(
                 #     text, speaker, language, speed
                 # ):
@@ -84,7 +82,7 @@ class WebSocketHandler:
                 #     )
                 #     await send_audio_stream(websocket, cloned_audio_stream)
 
-                await send_audio_stream(websocket, cloned_audio_stream)
+                await send_audio_stream(websocket, audio_stream)
         except WebSocketDisconnect:
             await self.disconnect(websocket)
         except Exception as e:
