@@ -34,10 +34,13 @@ class WebSocketHandler:
         self.model = tts_model
         self.clone_model = clone_model
         self.connections = set()
-        self.source_se = torch.load(
-            "../resources/checkpoints/base_speakers/EN/en_default_se.pth"
-        ).to(self.model.device)
+        # self.source_se = torch.load(
+        #     "../resources/checkpoints/base_speakers/EN/en_default_se.pth"
+        # ).to(self.model.device)
         refrence_speaker = "../resources/Abdulla.mp3"
+        self.source_se, audio_name = se_extractor.get_se(
+            refrence_speaker, self.model, vad=True
+        )
         self.target_se, audio_name = se_extractor.get_se(
             refrence_speaker, self.clone_model, vad=True
         )
