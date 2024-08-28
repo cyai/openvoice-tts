@@ -1,0 +1,3986 @@
+I am trying to add feature of voice cloning to openvoice tts model. THe code for openvoice tts model looks like below:
+
+## __init__.py
+
+<code>
+
+
+</code>
+
+## api.py
+
+<code>
+
+import torch
+import numpy as np
+import re
+import soundfile
+from openvoice import utils
+from openvoice import commons
+import os
+import librosa
+from openvoice.text import text_to_sequence
+from openvoice.mel_processing import spectrogram_torch
+from openvoice.models import SynthesizerTrn
+
+
+class OpenVoiceBaseClass(object):
+    def __init__(self, 
+                config_path, 
+                device='cuda:0'):
+        if 'cuda' in device:
+            assert torch.cuda.is_available()
+
+        hps = utils.get_hparams_from_file(config_path)
+
+        model = SynthesizerTrn(
+            len(getattr(hps, 'symbols', [])),
+            hps.data.filter_length // 2 + 1,
+            n_speakers=hps.data.n_speakers,
+            **hps.model,
+        ).to(device)
+
+        model.eval()
+        self.model = model
+        self.hps = hps
+        self.device = device
+
+    def load_ckpt(self, ckpt_path):
+        checkpoint_dict = torch.load(ckpt_path, map_location=torch.device(self.device))
+        a, b = self.model.load_state_dict(checkpoint_dict['model'], strict=False)
+
+
+class BaseSpeakerTTS(OpenVoiceBaseClass):
+    language_marks = {
+        "english": "EN",
+        "chinese": "ZH",
+    }
+
+    @staticmethod
+    def get_text(text, hps, is_symbol):
+        text_norm = text_to_sequence(text, hps.symbols, [] if is_symbol else hps.data.text_cleaners)
+        if hps.data.add_blank:
+            text_norm = commons.intersperse(text_norm, 0)
+        text_norm = torch.LongTensor(text_norm)
+        return text_norm
+
+    @staticmethod
+    def audio_numpy_concat(segment_data_list, sr, speed=1.):
+        audio_segments = []
+        for segment_data in segment_data_list:
+            audio_segments += segment_data.reshape(-1).tolist()
+            audio_segments += [0] * int((sr * 0.05)/speed)
+        audio_segments = np.array(audio_segments).astype(np.float32)
+        return audio_segments
+
+    @staticmethod
+    def split_sentences_into_pieces(text, language_str):
+        texts = utils.split_sentence(text, language_str=language_str)
+        return texts
+
+    def tts(self, text, output_path, speaker, language='English', speed=1.0):
+        mark = self.language_marks.get(language.lower(), None)
+        assert mark is not None, f"language {language} is not supported"
+
+        texts = self.split_sentences_into_pieces(text, mark)
+
+        audio_list = []
+        for t in texts:
+            t = re.sub(r'([a-z])([A-Z])', r'\1 \2', t)
+            t = f'[{mark}]{t}[{mark}]'
+            stn_tst = self.get_text(t, self.hps, False)
+            device = self.device
+            speaker_id = self.hps.speakers[speaker]
+            with torch.no_grad():
+                x_tst = stn_tst.unsqueeze(0).to(device)
+                x_tst_lengths = torch.LongTensor([stn_tst.size(0)]).to(device)
+                sid = torch.LongTensor([speaker_id]).to(device)
+                audio = self.model.infer(x_tst, x_tst_lengths, sid=sid, noise_scale=0.667, noise_scale_w=0.6,
+                                    length_scale=1.0 / speed)[0][0, 0].data.cpu().float().numpy()
+            audio_list.append(audio)
+        audio = self.audio_numpy_concat(audio_list, sr=self.hps.data.sampling_rate, speed=speed)
+
+        if output_path is None:
+            return audio
+        else:
+            soundfile.write(output_path, audio, self.hps.data.sampling_rate)
+
+
+class ToneColorConverter(OpenVoiceBaseClass):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+
+        if kwargs.get('enable_watermark', True):
+            import wavmark
+            self.watermark_model = wavmark.load_model().to(self.device)
+        else:
+            self.watermark_model = None
+
+
+
+    def extract_se(self, ref_wav_list, se_save_path=None):
+        if isinstance(ref_wav_list, str):
+            ref_wav_list = [ref_wav_list]
+        
+        device = self.device
+        hps = self.hps
+        gs = []
+        
+        for fname in ref_wav_list:
+            audio_ref, sr = librosa.load(fname, sr=hps.data.sampling_rate)
+            y = torch.FloatTensor(audio_ref)
+            y = y.to(device)
+            y = y.unsqueeze(0)
+            y = spectrogram_torch(y, hps.data.filter_length,
+                                        hps.data.sampling_rate, hps.data.hop_length, hps.data.win_length,
+                                        center=False).to(device)
+            with torch.no_grad():
+                g = self.model.ref_enc(y.transpose(1, 2)).unsqueeze(-1)
+                gs.append(g.detach())
+        gs = torch.stack(gs).mean(0)
+
+        if se_save_path is not None:
+            os.makedirs(os.path.dirname(se_save_path), exist_ok=True)
+            torch.save(gs.cpu(), se_save_path)
+
+        return gs
+
+    def convert(self, audio_src_path, src_se, tgt_se, output_path=None, tau=0.3, message="default"):
+        hps = self.hps
+        # load audio
+        audio, sample_rate = librosa.load(audio_src_path, sr=hps.data.sampling_rate)
+        audio = torch.tensor(audio).float()
+        
+        with torch.no_grad():
+            y = torch.FloatTensor(audio).to(self.device)
+            y = y.unsqueeze(0)
+            spec = spectrogram_torch(y, hps.data.filter_length,
+                                    hps.data.sampling_rate, hps.data.hop_length, hps.data.win_length,
+                                    center=False).to(self.device)
+            spec_lengths = torch.LongTensor([spec.size(-1)]).to(self.device)
+            audio = self.model.voice_conversion(spec, spec_lengths, sid_src=src_se, sid_tgt=tgt_se, tau=tau)[0][
+                        0, 0].data.cpu().float().numpy()
+            audio = self.add_watermark(audio, message)
+            if output_path is None:
+                return audio
+            else:
+                soundfile.write(output_path, audio, hps.data.sampling_rate)
+    
+    def add_watermark(self, audio, message):
+        if self.watermark_model is None:
+            return audio
+        device = self.device
+        bits = utils.string_to_bits(message).reshape(-1)
+        n_repeat = len(bits) // 32
+
+        K = 16000
+        coeff = 2
+        for n in range(n_repeat):
+            trunck = audio[(coeff * n) * K: (coeff * n + 1) * K]
+            if len(trunck) != K:
+                print('Audio too short, fail to add watermark')
+                break
+            message_npy = bits[n * 32: (n + 1) * 32]
+            
+            with torch.no_grad():
+                signal = torch.FloatTensor(trunck).to(device)[None]
+                message_tensor = torch.FloatTensor(message_npy).to(device)[None]
+                signal_wmd_tensor = self.watermark_model.encode(signal, message_tensor)
+                signal_wmd_npy = signal_wmd_tensor.detach().cpu().squeeze()
+            audio[(coeff * n) * K: (coeff * n + 1) * K] = signal_wmd_npy
+        return audio
+
+    def detect_watermark(self, audio, n_repeat):
+        bits = []
+        K = 16000
+        coeff = 2
+        for n in range(n_repeat):
+            trunck = audio[(coeff * n) * K: (coeff * n + 1) * K]
+            if len(trunck) != K:
+                print('Audio too short, fail to detect watermark')
+                return 'Fail'
+            with torch.no_grad():
+                signal = torch.FloatTensor(trunck).to(self.device).unsqueeze(0)
+                message_decoded_npy = (self.watermark_model.decode(signal) >= 0.5).int().detach().cpu().numpy().squeeze()
+            bits.append(message_decoded_npy)
+        bits = np.stack(bits).reshape(-1, 8)
+        message = utils.bits_to_string(bits)
+        return message
+    
+
+</code>
+
+## attentions.py
+
+<code>
+
+import math
+import torch
+from torch import nn
+from torch.nn import functional as F
+
+from openvoice import commons
+import logging
+
+logger = logging.getLogger(__name__)
+
+
+class LayerNorm(nn.Module):
+    def __init__(self, channels, eps=1e-5):
+        super().__init__()
+        self.channels = channels
+        self.eps = eps
+
+        self.gamma = nn.Parameter(torch.ones(channels))
+        self.beta = nn.Parameter(torch.zeros(channels))
+
+    def forward(self, x):
+        x = x.transpose(1, -1)
+        x = F.layer_norm(x, (self.channels,), self.gamma, self.beta, self.eps)
+        return x.transpose(1, -1)
+
+
+@torch.jit.script
+def fused_add_tanh_sigmoid_multiply(input_a, input_b, n_channels):
+    n_channels_int = n_channels[0]
+    in_act = input_a + input_b
+    t_act = torch.tanh(in_act[:, :n_channels_int, :])
+    s_act = torch.sigmoid(in_act[:, n_channels_int:, :])
+    acts = t_act * s_act
+    return acts
+
+
+class Encoder(nn.Module):
+    def __init__(
+        self,
+        hidden_channels,
+        filter_channels,
+        n_heads,
+        n_layers,
+        kernel_size=1,
+        p_dropout=0.0,
+        window_size=4,
+        isflow=True,
+        **kwargs
+    ):
+        super().__init__()
+        self.hidden_channels = hidden_channels
+        self.filter_channels = filter_channels
+        self.n_heads = n_heads
+        self.n_layers = n_layers
+        self.kernel_size = kernel_size
+        self.p_dropout = p_dropout
+        self.window_size = window_size
+        # if isflow:
+        #  cond_layer = torch.nn.Conv1d(256, 2*hidden_channels*n_layers, 1)
+        #  self.cond_pre = torch.nn.Conv1d(hidden_channels, 2*hidden_channels, 1)
+        #  self.cond_layer = weight_norm(cond_layer, name='weight')
+        #  self.gin_channels = 256
+        self.cond_layer_idx = self.n_layers
+        if "gin_channels" in kwargs:
+            self.gin_channels = kwargs["gin_channels"]
+            if self.gin_channels != 0:
+                self.spk_emb_linear = nn.Linear(self.gin_channels, self.hidden_channels)
+                # vits2 says 3rd block, so idx is 2 by default
+                self.cond_layer_idx = (
+                    kwargs["cond_layer_idx"] if "cond_layer_idx" in kwargs else 2
+                )
+                # logging.debug(self.gin_channels, self.cond_layer_idx)
+                assert (
+                    self.cond_layer_idx < self.n_layers
+                ), "cond_layer_idx should be less than n_layers"
+        self.drop = nn.Dropout(p_dropout)
+        self.attn_layers = nn.ModuleList()
+        self.norm_layers_1 = nn.ModuleList()
+        self.ffn_layers = nn.ModuleList()
+        self.norm_layers_2 = nn.ModuleList()
+
+        for i in range(self.n_layers):
+            self.attn_layers.append(
+                MultiHeadAttention(
+                    hidden_channels,
+                    hidden_channels,
+                    n_heads,
+                    p_dropout=p_dropout,
+                    window_size=window_size,
+                )
+            )
+            self.norm_layers_1.append(LayerNorm(hidden_channels))
+            self.ffn_layers.append(
+                FFN(
+                    hidden_channels,
+                    hidden_channels,
+                    filter_channels,
+                    kernel_size,
+                    p_dropout=p_dropout,
+                )
+            )
+            self.norm_layers_2.append(LayerNorm(hidden_channels))
+
+    def forward(self, x, x_mask, g=None):
+        attn_mask = x_mask.unsqueeze(2) * x_mask.unsqueeze(-1)
+        x = x * x_mask
+        for i in range(self.n_layers):
+            if i == self.cond_layer_idx and g is not None:
+                g = self.spk_emb_linear(g.transpose(1, 2))
+                g = g.transpose(1, 2)
+                x = x + g
+                x = x * x_mask
+            y = self.attn_layers[i](x, x, attn_mask)
+            y = self.drop(y)
+            x = self.norm_layers_1[i](x + y)
+
+            y = self.ffn_layers[i](x, x_mask)
+            y = self.drop(y)
+            x = self.norm_layers_2[i](x + y)
+        x = x * x_mask
+        return x
+
+
+class Decoder(nn.Module):
+    def __init__(
+        self,
+        hidden_channels,
+        filter_channels,
+        n_heads,
+        n_layers,
+        kernel_size=1,
+        p_dropout=0.0,
+        proximal_bias=False,
+        proximal_init=True,
+        **kwargs
+    ):
+        super().__init__()
+        self.hidden_channels = hidden_channels
+        self.filter_channels = filter_channels
+        self.n_heads = n_heads
+        self.n_layers = n_layers
+        self.kernel_size = kernel_size
+        self.p_dropout = p_dropout
+        self.proximal_bias = proximal_bias
+        self.proximal_init = proximal_init
+
+        self.drop = nn.Dropout(p_dropout)
+        self.self_attn_layers = nn.ModuleList()
+        self.norm_layers_0 = nn.ModuleList()
+        self.encdec_attn_layers = nn.ModuleList()
+        self.norm_layers_1 = nn.ModuleList()
+        self.ffn_layers = nn.ModuleList()
+        self.norm_layers_2 = nn.ModuleList()
+        for i in range(self.n_layers):
+            self.self_attn_layers.append(
+                MultiHeadAttention(
+                    hidden_channels,
+                    hidden_channels,
+                    n_heads,
+                    p_dropout=p_dropout,
+                    proximal_bias=proximal_bias,
+                    proximal_init=proximal_init,
+                )
+            )
+            self.norm_layers_0.append(LayerNorm(hidden_channels))
+            self.encdec_attn_layers.append(
+                MultiHeadAttention(
+                    hidden_channels, hidden_channels, n_heads, p_dropout=p_dropout
+                )
+            )
+            self.norm_layers_1.append(LayerNorm(hidden_channels))
+            self.ffn_layers.append(
+                FFN(
+                    hidden_channels,
+                    hidden_channels,
+                    filter_channels,
+                    kernel_size,
+                    p_dropout=p_dropout,
+                    causal=True,
+                )
+            )
+            self.norm_layers_2.append(LayerNorm(hidden_channels))
+
+    def forward(self, x, x_mask, h, h_mask):
+        """
+        x: decoder input
+        h: encoder output
+        """
+        self_attn_mask = commons.subsequent_mask(x_mask.size(2)).to(
+            device=x.device, dtype=x.dtype
+        )
+        encdec_attn_mask = h_mask.unsqueeze(2) * x_mask.unsqueeze(-1)
+        x = x * x_mask
+        for i in range(self.n_layers):
+            y = self.self_attn_layers[i](x, x, self_attn_mask)
+            y = self.drop(y)
+            x = self.norm_layers_0[i](x + y)
+
+            y = self.encdec_attn_layers[i](x, h, encdec_attn_mask)
+            y = self.drop(y)
+            x = self.norm_layers_1[i](x + y)
+
+            y = self.ffn_layers[i](x, x_mask)
+            y = self.drop(y)
+            x = self.norm_layers_2[i](x + y)
+        x = x * x_mask
+        return x
+
+
+class MultiHeadAttention(nn.Module):
+    def __init__(
+        self,
+        channels,
+        out_channels,
+        n_heads,
+        p_dropout=0.0,
+        window_size=None,
+        heads_share=True,
+        block_length=None,
+        proximal_bias=False,
+        proximal_init=False,
+    ):
+        super().__init__()
+        assert channels % n_heads == 0
+
+        self.channels = channels
+        self.out_channels = out_channels
+        self.n_heads = n_heads
+        self.p_dropout = p_dropout
+        self.window_size = window_size
+        self.heads_share = heads_share
+        self.block_length = block_length
+        self.proximal_bias = proximal_bias
+        self.proximal_init = proximal_init
+        self.attn = None
+
+        self.k_channels = channels // n_heads
+        self.conv_q = nn.Conv1d(channels, channels, 1)
+        self.conv_k = nn.Conv1d(channels, channels, 1)
+        self.conv_v = nn.Conv1d(channels, channels, 1)
+        self.conv_o = nn.Conv1d(channels, out_channels, 1)
+        self.drop = nn.Dropout(p_dropout)
+
+        if window_size is not None:
+            n_heads_rel = 1 if heads_share else n_heads
+            rel_stddev = self.k_channels**-0.5
+            self.emb_rel_k = nn.Parameter(
+                torch.randn(n_heads_rel, window_size * 2 + 1, self.k_channels)
+                * rel_stddev
+            )
+            self.emb_rel_v = nn.Parameter(
+                torch.randn(n_heads_rel, window_size * 2 + 1, self.k_channels)
+                * rel_stddev
+            )
+
+        nn.init.xavier_uniform_(self.conv_q.weight)
+        nn.init.xavier_uniform_(self.conv_k.weight)
+        nn.init.xavier_uniform_(self.conv_v.weight)
+        if proximal_init:
+            with torch.no_grad():
+                self.conv_k.weight.copy_(self.conv_q.weight)
+                self.conv_k.bias.copy_(self.conv_q.bias)
+
+    def forward(self, x, c, attn_mask=None):
+        q = self.conv_q(x)
+        k = self.conv_k(c)
+        v = self.conv_v(c)
+
+        x, self.attn = self.attention(q, k, v, mask=attn_mask)
+
+        x = self.conv_o(x)
+        return x
+
+    def attention(self, query, key, value, mask=None):
+        # reshape [b, d, t] -> [b, n_h, t, d_k]
+        b, d, t_s, t_t = (*key.size(), query.size(2))
+        query = query.view(b, self.n_heads, self.k_channels, t_t).transpose(2, 3)
+        key = key.view(b, self.n_heads, self.k_channels, t_s).transpose(2, 3)
+        value = value.view(b, self.n_heads, self.k_channels, t_s).transpose(2, 3)
+
+        scores = torch.matmul(query / math.sqrt(self.k_channels), key.transpose(-2, -1))
+        if self.window_size is not None:
+            assert (
+                t_s == t_t
+            ), "Relative attention is only available for self-attention."
+            key_relative_embeddings = self._get_relative_embeddings(self.emb_rel_k, t_s)
+            rel_logits = self._matmul_with_relative_keys(
+                query / math.sqrt(self.k_channels), key_relative_embeddings
+            )
+            scores_local = self._relative_position_to_absolute_position(rel_logits)
+            scores = scores + scores_local
+        if self.proximal_bias:
+            assert t_s == t_t, "Proximal bias is only available for self-attention."
+            scores = scores + self._attention_bias_proximal(t_s).to(
+                device=scores.device, dtype=scores.dtype
+            )
+        if mask is not None:
+            scores = scores.masked_fill(mask == 0, -1e4)
+            if self.block_length is not None:
+                assert (
+                    t_s == t_t
+                ), "Local attention is only available for self-attention."
+                block_mask = (
+                    torch.ones_like(scores)
+                    .triu(-self.block_length)
+                    .tril(self.block_length)
+                )
+                scores = scores.masked_fill(block_mask == 0, -1e4)
+        p_attn = F.softmax(scores, dim=-1)  # [b, n_h, t_t, t_s]
+        p_attn = self.drop(p_attn)
+        output = torch.matmul(p_attn, value)
+        if self.window_size is not None:
+            relative_weights = self._absolute_position_to_relative_position(p_attn)
+            value_relative_embeddings = self._get_relative_embeddings(
+                self.emb_rel_v, t_s
+            )
+            output = output + self._matmul_with_relative_values(
+                relative_weights, value_relative_embeddings
+            )
+        output = (
+            output.transpose(2, 3).contiguous().view(b, d, t_t)
+        )  # [b, n_h, t_t, d_k] -> [b, d, t_t]
+        return output, p_attn
+
+    def _matmul_with_relative_values(self, x, y):
+        """
+        x: [b, h, l, m]
+        y: [h or 1, m, d]
+        ret: [b, h, l, d]
+        """
+        ret = torch.matmul(x, y.unsqueeze(0))
+        return ret
+
+    def _matmul_with_relative_keys(self, x, y):
+        """
+        x: [b, h, l, d]
+        y: [h or 1, m, d]
+        ret: [b, h, l, m]
+        """
+        ret = torch.matmul(x, y.unsqueeze(0).transpose(-2, -1))
+        return ret
+
+    def _get_relative_embeddings(self, relative_embeddings, length):
+        2 * self.window_size + 1
+        # Pad first before slice to avoid using cond ops.
+        pad_length = max(length - (self.window_size + 1), 0)
+        slice_start_position = max((self.window_size + 1) - length, 0)
+        slice_end_position = slice_start_position + 2 * length - 1
+        if pad_length > 0:
+            padded_relative_embeddings = F.pad(
+                relative_embeddings,
+                commons.convert_pad_shape([[0, 0], [pad_length, pad_length], [0, 0]]),
+            )
+        else:
+            padded_relative_embeddings = relative_embeddings
+        used_relative_embeddings = padded_relative_embeddings[
+            :, slice_start_position:slice_end_position
+        ]
+        return used_relative_embeddings
+
+    def _relative_position_to_absolute_position(self, x):
+        """
+        x: [b, h, l, 2*l-1]
+        ret: [b, h, l, l]
+        """
+        batch, heads, length, _ = x.size()
+        # Concat columns of pad to shift from relative to absolute indexing.
+        x = F.pad(x, commons.convert_pad_shape([[0, 0], [0, 0], [0, 0], [0, 1]]))
+
+        # Concat extra elements so to add up to shape (len+1, 2*len-1).
+        x_flat = x.view([batch, heads, length * 2 * length])
+        x_flat = F.pad(
+            x_flat, commons.convert_pad_shape([[0, 0], [0, 0], [0, length - 1]])
+        )
+
+        # Reshape and slice out the padded elements.
+        x_final = x_flat.view([batch, heads, length + 1, 2 * length - 1])[
+            :, :, :length, length - 1 :
+        ]
+        return x_final
+
+    def _absolute_position_to_relative_position(self, x):
+        """
+        x: [b, h, l, l]
+        ret: [b, h, l, 2*l-1]
+        """
+        batch, heads, length, _ = x.size()
+        # pad along column
+        x = F.pad(
+            x, commons.convert_pad_shape([[0, 0], [0, 0], [0, 0], [0, length - 1]])
+        )
+        x_flat = x.view([batch, heads, length**2 + length * (length - 1)])
+        # add 0's in the beginning that will skew the elements after reshape
+        x_flat = F.pad(x_flat, commons.convert_pad_shape([[0, 0], [0, 0], [length, 0]]))
+        x_final = x_flat.view([batch, heads, length, 2 * length])[:, :, :, 1:]
+        return x_final
+
+    def _attention_bias_proximal(self, length):
+        """Bias for self-attention to encourage attention to close positions.
+        Args:
+          length: an integer scalar.
+        Returns:
+          a Tensor with shape [1, 1, length, length]
+        """
+        r = torch.arange(length, dtype=torch.float32)
+        diff = torch.unsqueeze(r, 0) - torch.unsqueeze(r, 1)
+        return torch.unsqueeze(torch.unsqueeze(-torch.log1p(torch.abs(diff)), 0), 0)
+
+
+class FFN(nn.Module):
+    def __init__(
+        self,
+        in_channels,
+        out_channels,
+        filter_channels,
+        kernel_size,
+        p_dropout=0.0,
+        activation=None,
+        causal=False,
+    ):
+        super().__init__()
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.filter_channels = filter_channels
+        self.kernel_size = kernel_size
+        self.p_dropout = p_dropout
+        self.activation = activation
+        self.causal = causal
+
+        if causal:
+            self.padding = self._causal_padding
+        else:
+            self.padding = self._same_padding
+
+        self.conv_1 = nn.Conv1d(in_channels, filter_channels, kernel_size)
+        self.conv_2 = nn.Conv1d(filter_channels, out_channels, kernel_size)
+        self.drop = nn.Dropout(p_dropout)
+
+    def forward(self, x, x_mask):
+        x = self.conv_1(self.padding(x * x_mask))
+        if self.activation == "gelu":
+            x = x * torch.sigmoid(1.702 * x)
+        else:
+            x = torch.relu(x)
+        x = self.drop(x)
+        x = self.conv_2(self.padding(x * x_mask))
+        return x * x_mask
+
+    def _causal_padding(self, x):
+        if self.kernel_size == 1:
+            return x
+        pad_l = self.kernel_size - 1
+        pad_r = 0
+        padding = [[0, 0], [0, 0], [pad_l, pad_r]]
+        x = F.pad(x, commons.convert_pad_shape(padding))
+        return x
+
+    def _same_padding(self, x):
+        if self.kernel_size == 1:
+            return x
+        pad_l = (self.kernel_size - 1) // 2
+        pad_r = self.kernel_size // 2
+        padding = [[0, 0], [0, 0], [pad_l, pad_r]]
+        x = F.pad(x, commons.convert_pad_shape(padding))
+        return x
+
+</code>
+
+## commons.py
+
+<code>
+
+import math
+import torch
+from torch.nn import functional as F
+
+
+def init_weights(m, mean=0.0, std=0.01):
+    classname = m.__class__.__name__
+    if classname.find("Conv") != -1:
+        m.weight.data.normal_(mean, std)
+
+
+def get_padding(kernel_size, dilation=1):
+    return int((kernel_size * dilation - dilation) / 2)
+
+
+def convert_pad_shape(pad_shape):
+    layer = pad_shape[::-1]
+    pad_shape = [item for sublist in layer for item in sublist]
+    return pad_shape
+
+
+def intersperse(lst, item):
+    result = [item] * (len(lst) * 2 + 1)
+    result[1::2] = lst
+    return result
+
+
+def kl_divergence(m_p, logs_p, m_q, logs_q):
+    """KL(P||Q)"""
+    kl = (logs_q - logs_p) - 0.5
+    kl += (
+        0.5 * (torch.exp(2.0 * logs_p) + ((m_p - m_q) ** 2)) * torch.exp(-2.0 * logs_q)
+    )
+    return kl
+
+
+def rand_gumbel(shape):
+    """Sample from the Gumbel distribution, protect from overflows."""
+    uniform_samples = torch.rand(shape) * 0.99998 + 0.00001
+    return -torch.log(-torch.log(uniform_samples))
+
+
+def rand_gumbel_like(x):
+    g = rand_gumbel(x.size()).to(dtype=x.dtype, device=x.device)
+    return g
+
+
+def slice_segments(x, ids_str, segment_size=4):
+    ret = torch.zeros_like(x[:, :, :segment_size])
+    for i in range(x.size(0)):
+        idx_str = ids_str[i]
+        idx_end = idx_str + segment_size
+        ret[i] = x[i, :, idx_str:idx_end]
+    return ret
+
+
+def rand_slice_segments(x, x_lengths=None, segment_size=4):
+    b, d, t = x.size()
+    if x_lengths is None:
+        x_lengths = t
+    ids_str_max = x_lengths - segment_size + 1
+    ids_str = (torch.rand([b]).to(device=x.device) * ids_str_max).to(dtype=torch.long)
+    ret = slice_segments(x, ids_str, segment_size)
+    return ret, ids_str
+
+
+def get_timing_signal_1d(length, channels, min_timescale=1.0, max_timescale=1.0e4):
+    position = torch.arange(length, dtype=torch.float)
+    num_timescales = channels // 2
+    log_timescale_increment = math.log(float(max_timescale) / float(min_timescale)) / (
+        num_timescales - 1
+    )
+    inv_timescales = min_timescale * torch.exp(
+        torch.arange(num_timescales, dtype=torch.float) * -log_timescale_increment
+    )
+    scaled_time = position.unsqueeze(0) * inv_timescales.unsqueeze(1)
+    signal = torch.cat([torch.sin(scaled_time), torch.cos(scaled_time)], 0)
+    signal = F.pad(signal, [0, 0, 0, channels % 2])
+    signal = signal.view(1, channels, length)
+    return signal
+
+
+def add_timing_signal_1d(x, min_timescale=1.0, max_timescale=1.0e4):
+    b, channels, length = x.size()
+    signal = get_timing_signal_1d(length, channels, min_timescale, max_timescale)
+    return x + signal.to(dtype=x.dtype, device=x.device)
+
+
+def cat_timing_signal_1d(x, min_timescale=1.0, max_timescale=1.0e4, axis=1):
+    b, channels, length = x.size()
+    signal = get_timing_signal_1d(length, channels, min_timescale, max_timescale)
+    return torch.cat([x, signal.to(dtype=x.dtype, device=x.device)], axis)
+
+
+def subsequent_mask(length):
+    mask = torch.tril(torch.ones(length, length)).unsqueeze(0).unsqueeze(0)
+    return mask
+
+
+@torch.jit.script
+def fused_add_tanh_sigmoid_multiply(input_a, input_b, n_channels):
+    n_channels_int = n_channels[0]
+    in_act = input_a + input_b
+    t_act = torch.tanh(in_act[:, :n_channels_int, :])
+    s_act = torch.sigmoid(in_act[:, n_channels_int:, :])
+    acts = t_act * s_act
+    return acts
+
+
+def convert_pad_shape(pad_shape):
+    layer = pad_shape[::-1]
+    pad_shape = [item for sublist in layer for item in sublist]
+    return pad_shape
+
+
+def shift_1d(x):
+    x = F.pad(x, convert_pad_shape([[0, 0], [0, 0], [1, 0]]))[:, :, :-1]
+    return x
+
+
+def sequence_mask(length, max_length=None):
+    if max_length is None:
+        max_length = length.max()
+    x = torch.arange(max_length, dtype=length.dtype, device=length.device)
+    return x.unsqueeze(0) < length.unsqueeze(1)
+
+
+def generate_path(duration, mask):
+    """
+    duration: [b, 1, t_x]
+    mask: [b, 1, t_y, t_x]
+    """
+
+    b, _, t_y, t_x = mask.shape
+    cum_duration = torch.cumsum(duration, -1)
+
+    cum_duration_flat = cum_duration.view(b * t_x)
+    path = sequence_mask(cum_duration_flat, t_y).to(mask.dtype)
+    path = path.view(b, t_x, t_y)
+    path = path - F.pad(path, convert_pad_shape([[0, 0], [1, 0], [0, 0]]))[:, :-1]
+    path = path.unsqueeze(1).transpose(2, 3) * mask
+    return path
+
+
+def clip_grad_value_(parameters, clip_value, norm_type=2):
+    if isinstance(parameters, torch.Tensor):
+        parameters = [parameters]
+    parameters = list(filter(lambda p: p.grad is not None, parameters))
+    norm_type = float(norm_type)
+    if clip_value is not None:
+        clip_value = float(clip_value)
+
+    total_norm = 0
+    for p in parameters:
+        param_norm = p.grad.data.norm(norm_type)
+        total_norm += param_norm.item() ** norm_type
+        if clip_value is not None:
+            p.grad.data.clamp_(min=-clip_value, max=clip_value)
+    total_norm = total_norm ** (1.0 / norm_type)
+    return total_norm
+
+</code>
+
+## mel_processing.py
+
+<code>
+
+import torch
+import torch.utils.data
+from librosa.filters import mel as librosa_mel_fn
+
+MAX_WAV_VALUE = 32768.0
+
+
+def dynamic_range_compression_torch(x, C=1, clip_val=1e-5):
+    """
+    PARAMS
+    ------
+    C: compression factor
+    """
+    return torch.log(torch.clamp(x, min=clip_val) * C)
+
+
+def dynamic_range_decompression_torch(x, C=1):
+    """
+    PARAMS
+    ------
+    C: compression factor used to compress
+    """
+    return torch.exp(x) / C
+
+
+def spectral_normalize_torch(magnitudes):
+    output = dynamic_range_compression_torch(magnitudes)
+    return output
+
+
+def spectral_de_normalize_torch(magnitudes):
+    output = dynamic_range_decompression_torch(magnitudes)
+    return output
+
+
+mel_basis = {}
+hann_window = {}
+
+
+def spectrogram_torch(y, n_fft, sampling_rate, hop_size, win_size, center=False):
+    if torch.min(y) < -1.1:
+        print("min value is ", torch.min(y))
+    if torch.max(y) > 1.1:
+        print("max value is ", torch.max(y))
+
+    global hann_window
+    dtype_device = str(y.dtype) + "_" + str(y.device)
+    wnsize_dtype_device = str(win_size) + "_" + dtype_device
+    if wnsize_dtype_device not in hann_window:
+        hann_window[wnsize_dtype_device] = torch.hann_window(win_size).to(
+            dtype=y.dtype, device=y.device
+        )
+
+    y = torch.nn.functional.pad(
+        y.unsqueeze(1),
+        (int((n_fft - hop_size) / 2), int((n_fft - hop_size) / 2)),
+        mode="reflect",
+    )
+    y = y.squeeze(1)
+
+    spec = torch.stft(
+        y,
+        n_fft,
+        hop_length=hop_size,
+        win_length=win_size,
+        window=hann_window[wnsize_dtype_device],
+        center=center,
+        pad_mode="reflect",
+        normalized=False,
+        onesided=True,
+        return_complex=False,
+    )
+
+    spec = torch.sqrt(spec.pow(2).sum(-1) + 1e-6)
+    return spec
+
+
+def spectrogram_torch_conv(y, n_fft, sampling_rate, hop_size, win_size, center=False):
+    # if torch.min(y) < -1.:
+    #     print('min value is ', torch.min(y))
+    # if torch.max(y) > 1.:
+    #     print('max value is ', torch.max(y))
+
+    global hann_window
+    dtype_device = str(y.dtype) + '_' + str(y.device)
+    wnsize_dtype_device = str(win_size) + '_' + dtype_device
+    if wnsize_dtype_device not in hann_window:
+        hann_window[wnsize_dtype_device] = torch.hann_window(win_size).to(dtype=y.dtype, device=y.device)
+
+    y = torch.nn.functional.pad(y.unsqueeze(1), (int((n_fft-hop_size)/2), int((n_fft-hop_size)/2)), mode='reflect')
+    
+    # ******************** original ************************#
+    # y = y.squeeze(1)
+    # spec1 = torch.stft(y, n_fft, hop_length=hop_size, win_length=win_size, window=hann_window[wnsize_dtype_device],
+    #                   center=center, pad_mode='reflect', normalized=False, onesided=True, return_complex=False)
+
+    # ******************** ConvSTFT ************************#
+    freq_cutoff = n_fft // 2 + 1
+    fourier_basis = torch.view_as_real(torch.fft.fft(torch.eye(n_fft)))
+    forward_basis = fourier_basis[:freq_cutoff].permute(2, 0, 1).reshape(-1, 1, fourier_basis.shape[1])
+    forward_basis = forward_basis * torch.as_tensor(librosa.util.pad_center(torch.hann_window(win_size), size=n_fft)).float()
+
+    import torch.nn.functional as F
+
+    # if center:
+    #     signal = F.pad(y[:, None, None, :], (n_fft // 2, n_fft // 2, 0, 0), mode = 'reflect').squeeze(1)
+    assert center is False
+
+    forward_transform_squared = F.conv1d(y, forward_basis.to(y.device), stride = hop_size)
+    spec2 = torch.stack([forward_transform_squared[:, :freq_cutoff, :], forward_transform_squared[:, freq_cutoff:, :]], dim = -1)
+
+
+    # ******************** Verification ************************#
+    spec1 = torch.stft(y.squeeze(1), n_fft, hop_length=hop_size, win_length=win_size, window=hann_window[wnsize_dtype_device],
+                      center=center, pad_mode='reflect', normalized=False, onesided=True, return_complex=False)
+    assert torch.allclose(spec1, spec2, atol=1e-4)
+
+    spec = torch.sqrt(spec2.pow(2).sum(-1) + 1e-6)
+    return spec
+
+
+def spec_to_mel_torch(spec, n_fft, num_mels, sampling_rate, fmin, fmax):
+    global mel_basis
+    dtype_device = str(spec.dtype) + "_" + str(spec.device)
+    fmax_dtype_device = str(fmax) + "_" + dtype_device
+    if fmax_dtype_device not in mel_basis:
+        mel = librosa_mel_fn(sampling_rate, n_fft, num_mels, fmin, fmax)
+        mel_basis[fmax_dtype_device] = torch.from_numpy(mel).to(
+            dtype=spec.dtype, device=spec.device
+        )
+    spec = torch.matmul(mel_basis[fmax_dtype_device], spec)
+    spec = spectral_normalize_torch(spec)
+    return spec
+
+
+def mel_spectrogram_torch(
+    y, n_fft, num_mels, sampling_rate, hop_size, win_size, fmin, fmax, center=False
+):
+    if torch.min(y) < -1.0:
+        print("min value is ", torch.min(y))
+    if torch.max(y) > 1.0:
+        print("max value is ", torch.max(y))
+
+    global mel_basis, hann_window
+    dtype_device = str(y.dtype) + "_" + str(y.device)
+    fmax_dtype_device = str(fmax) + "_" + dtype_device
+    wnsize_dtype_device = str(win_size) + "_" + dtype_device
+    if fmax_dtype_device not in mel_basis:
+        mel = librosa_mel_fn(sampling_rate, n_fft, num_mels, fmin, fmax)
+        mel_basis[fmax_dtype_device] = torch.from_numpy(mel).to(
+            dtype=y.dtype, device=y.device
+        )
+    if wnsize_dtype_device not in hann_window:
+        hann_window[wnsize_dtype_device] = torch.hann_window(win_size).to(
+            dtype=y.dtype, device=y.device
+        )
+
+    y = torch.nn.functional.pad(
+        y.unsqueeze(1),
+        (int((n_fft - hop_size) / 2), int((n_fft - hop_size) / 2)),
+        mode="reflect",
+    )
+    y = y.squeeze(1)
+
+    spec = torch.stft(
+        y,
+        n_fft,
+        hop_length=hop_size,
+        win_length=win_size,
+        window=hann_window[wnsize_dtype_device],
+        center=center,
+        pad_mode="reflect",
+        normalized=False,
+        onesided=True,
+        return_complex=False,
+    )
+
+    spec = torch.sqrt(spec.pow(2).sum(-1) + 1e-6)
+
+    spec = torch.matmul(mel_basis[fmax_dtype_device], spec)
+    spec = spectral_normalize_torch(spec)
+
+    return spec
+</code>
+
+## models.py
+
+<code>
+
+import math
+import torch
+from torch import nn
+from torch.nn import functional as F
+
+from openvoice import commons
+from openvoice import modules
+from openvoice import attentions
+
+from torch.nn import Conv1d, ConvTranspose1d, Conv2d
+from torch.nn.utils import weight_norm, remove_weight_norm, spectral_norm
+
+from openvoice.commons import init_weights, get_padding
+
+
+class TextEncoder(nn.Module):
+	def __init__(self,
+			n_vocab,
+			out_channels,
+			hidden_channels,
+			filter_channels,
+			n_heads,
+			n_layers,
+			kernel_size,
+			p_dropout):
+		super().__init__()
+		self.n_vocab = n_vocab
+		self.out_channels = out_channels
+		self.hidden_channels = hidden_channels
+		self.filter_channels = filter_channels
+		self.n_heads = n_heads
+		self.n_layers = n_layers
+		self.kernel_size = kernel_size
+		self.p_dropout = p_dropout
+
+		self.emb = nn.Embedding(n_vocab, hidden_channels)
+		nn.init.normal_(self.emb.weight, 0.0, hidden_channels**-0.5)
+
+		self.encoder = attentions.Encoder(
+			hidden_channels,
+			filter_channels,
+			n_heads,
+			n_layers,
+			kernel_size,
+			p_dropout)
+		self.proj= nn.Conv1d(hidden_channels, out_channels * 2, 1)
+
+	def forward(self, x, x_lengths):
+		x = self.emb(x) * math.sqrt(self.hidden_channels) # [b, t, h]
+		x = torch.transpose(x, 1, -1) # [b, h, t]
+		x_mask = torch.unsqueeze(commons.sequence_mask(x_lengths, x.size(2)), 1).to(x.dtype)
+
+		x = self.encoder(x * x_mask, x_mask)
+		stats = self.proj(x) * x_mask
+
+		m, logs = torch.split(stats, self.out_channels, dim=1)
+		return x, m, logs, x_mask
+     
+
+class DurationPredictor(nn.Module):
+    def __init__(
+        self, in_channels, filter_channels, kernel_size, p_dropout, gin_channels=0
+    ):
+        super().__init__()
+
+        self.in_channels = in_channels
+        self.filter_channels = filter_channels
+        self.kernel_size = kernel_size
+        self.p_dropout = p_dropout
+        self.gin_channels = gin_channels
+
+        self.drop = nn.Dropout(p_dropout)
+        self.conv_1 = nn.Conv1d(
+            in_channels, filter_channels, kernel_size, padding=kernel_size // 2
+        )
+        self.norm_1 = modules.LayerNorm(filter_channels)
+        self.conv_2 = nn.Conv1d(
+            filter_channels, filter_channels, kernel_size, padding=kernel_size // 2
+        )
+        self.norm_2 = modules.LayerNorm(filter_channels)
+        self.proj = nn.Conv1d(filter_channels, 1, 1)
+
+        if gin_channels != 0:
+            self.cond = nn.Conv1d(gin_channels, in_channels, 1)
+
+    def forward(self, x, x_mask, g=None):
+        x = torch.detach(x)
+        if g is not None:
+            g = torch.detach(g)
+            x = x + self.cond(g)
+        x = self.conv_1(x * x_mask)
+        x = torch.relu(x)
+        x = self.norm_1(x)
+        x = self.drop(x)
+        x = self.conv_2(x * x_mask)
+        x = torch.relu(x)
+        x = self.norm_2(x)
+        x = self.drop(x)
+        x = self.proj(x * x_mask)
+        return x * x_mask
+               
+class StochasticDurationPredictor(nn.Module):
+	def __init__(self, in_channels, filter_channels, kernel_size, p_dropout, n_flows=4, gin_channels=0):
+		super().__init__()
+		filter_channels = in_channels # it needs to be removed from future version.
+		self.in_channels = in_channels
+		self.filter_channels = filter_channels
+		self.kernel_size = kernel_size
+		self.p_dropout = p_dropout
+		self.n_flows = n_flows
+		self.gin_channels = gin_channels
+
+		self.log_flow = modules.Log()
+		self.flows = nn.ModuleList()
+		self.flows.append(modules.ElementwiseAffine(2))
+		for i in range(n_flows):
+			self.flows.append(modules.ConvFlow(2, filter_channels, kernel_size, n_layers=3))
+			self.flows.append(modules.Flip())
+
+		self.post_pre = nn.Conv1d(1, filter_channels, 1)
+		self.post_proj = nn.Conv1d(filter_channels, filter_channels, 1)
+		self.post_convs = modules.DDSConv(filter_channels, kernel_size, n_layers=3, p_dropout=p_dropout)
+		self.post_flows = nn.ModuleList()
+		self.post_flows.append(modules.ElementwiseAffine(2))
+		for i in range(4):
+			self.post_flows.append(modules.ConvFlow(2, filter_channels, kernel_size, n_layers=3))
+			self.post_flows.append(modules.Flip())
+
+		self.pre = nn.Conv1d(in_channels, filter_channels, 1)
+		self.proj = nn.Conv1d(filter_channels, filter_channels, 1)
+		self.convs = modules.DDSConv(filter_channels, kernel_size, n_layers=3, p_dropout=p_dropout)
+		if gin_channels != 0:
+			self.cond = nn.Conv1d(gin_channels, filter_channels, 1)
+
+	def forward(self, x, x_mask, w=None, g=None, reverse=False, noise_scale=1.0):
+		x = torch.detach(x)
+		x = self.pre(x)
+		if g is not None:
+			g = torch.detach(g)
+			x = x + self.cond(g)
+		x = self.convs(x, x_mask)
+		x = self.proj(x) * x_mask
+
+		if not reverse:
+			flows = self.flows
+			assert w is not None
+
+			logdet_tot_q = 0
+			h_w = self.post_pre(w)
+			h_w = self.post_convs(h_w, x_mask)
+			h_w = self.post_proj(h_w) * x_mask
+			e_q = torch.randn(w.size(0), 2, w.size(2)).to(device=x.device, dtype=x.dtype) * x_mask
+			z_q = e_q
+			for flow in self.post_flows:
+				z_q, logdet_q = flow(z_q, x_mask, g=(x + h_w))
+				logdet_tot_q += logdet_q
+			z_u, z1 = torch.split(z_q, [1, 1], 1)
+			u = torch.sigmoid(z_u) * x_mask
+			z0 = (w - u) * x_mask
+			logdet_tot_q += torch.sum((F.logsigmoid(z_u) + F.logsigmoid(-z_u)) * x_mask, [1,2])
+			logq = torch.sum(-0.5 * (math.log(2*math.pi) + (e_q**2)) * x_mask, [1,2]) - logdet_tot_q
+
+			logdet_tot = 0
+			z0, logdet = self.log_flow(z0, x_mask)
+			logdet_tot += logdet
+			z = torch.cat([z0, z1], 1)
+			for flow in flows:
+				z, logdet = flow(z, x_mask, g=x, reverse=reverse)
+				logdet_tot = logdet_tot + logdet
+			nll = torch.sum(0.5 * (math.log(2*math.pi) + (z**2)) * x_mask, [1,2]) - logdet_tot
+			return nll + logq # [b]
+		else:
+			flows = list(reversed(self.flows))
+			flows = flows[:-2] + [flows[-1]] # remove a useless vflow
+			z = torch.randn(x.size(0), 2, x.size(2)).to(device=x.device, dtype=x.dtype) * noise_scale
+			for flow in flows:
+				z = flow(z, x_mask, g=x, reverse=reverse)
+			z0, z1 = torch.split(z, [1, 1], 1)
+			logw = z0
+			return logw
+
+class PosteriorEncoder(nn.Module):
+    def __init__(
+        self,
+        in_channels,
+        out_channels,
+        hidden_channels,
+        kernel_size,
+        dilation_rate,
+        n_layers,
+        gin_channels=0,
+    ):
+        super().__init__()
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.hidden_channels = hidden_channels
+        self.kernel_size = kernel_size
+        self.dilation_rate = dilation_rate
+        self.n_layers = n_layers
+        self.gin_channels = gin_channels
+
+        self.pre = nn.Conv1d(in_channels, hidden_channels, 1)
+        self.enc = modules.WN(
+            hidden_channels,
+            kernel_size,
+            dilation_rate,
+            n_layers,
+            gin_channels=gin_channels,
+        )
+        self.proj = nn.Conv1d(hidden_channels, out_channels * 2, 1)
+
+    def forward(self, x, x_lengths, g=None, tau=1.0):
+        x_mask = torch.unsqueeze(commons.sequence_mask(x_lengths, x.size(2)), 1).to(
+            x.dtype
+        )
+        x = self.pre(x) * x_mask
+        x = self.enc(x, x_mask, g=g)
+        stats = self.proj(x) * x_mask
+        m, logs = torch.split(stats, self.out_channels, dim=1)
+        z = (m + torch.randn_like(m) * tau * torch.exp(logs)) * x_mask
+        return z, m, logs, x_mask
+
+
+class Generator(torch.nn.Module):
+    def __init__(
+        self,
+        initial_channel,
+        resblock,
+        resblock_kernel_sizes,
+        resblock_dilation_sizes,
+        upsample_rates,
+        upsample_initial_channel,
+        upsample_kernel_sizes,
+        gin_channels=0,
+    ):
+        super(Generator, self).__init__()
+        self.num_kernels = len(resblock_kernel_sizes)
+        self.num_upsamples = len(upsample_rates)
+        self.conv_pre = Conv1d(
+            initial_channel, upsample_initial_channel, 7, 1, padding=3
+        )
+        resblock = modules.ResBlock1 if resblock == "1" else modules.ResBlock2
+
+        self.ups = nn.ModuleList()
+        for i, (u, k) in enumerate(zip(upsample_rates, upsample_kernel_sizes)):
+            self.ups.append(
+                weight_norm(
+                    ConvTranspose1d(
+                        upsample_initial_channel // (2**i),
+                        upsample_initial_channel // (2 ** (i + 1)),
+                        k,
+                        u,
+                        padding=(k - u) // 2,
+                    )
+                )
+            )
+
+        self.resblocks = nn.ModuleList()
+        for i in range(len(self.ups)):
+            ch = upsample_initial_channel // (2 ** (i + 1))
+            for j, (k, d) in enumerate(
+                zip(resblock_kernel_sizes, resblock_dilation_sizes)
+            ):
+                self.resblocks.append(resblock(ch, k, d))
+
+        self.conv_post = Conv1d(ch, 1, 7, 1, padding=3, bias=False)
+        self.ups.apply(init_weights)
+
+        if gin_channels != 0:
+            self.cond = nn.Conv1d(gin_channels, upsample_initial_channel, 1)
+
+    def forward(self, x, g=None):
+        x = self.conv_pre(x)
+        if g is not None:
+            x = x + self.cond(g)
+
+        for i in range(self.num_upsamples):
+            x = F.leaky_relu(x, modules.LRELU_SLOPE)
+            x = self.ups[i](x)
+            xs = None
+            for j in range(self.num_kernels):
+                if xs is None:
+                    xs = self.resblocks[i * self.num_kernels + j](x)
+                else:
+                    xs += self.resblocks[i * self.num_kernels + j](x)
+            x = xs / self.num_kernels
+        x = F.leaky_relu(x)
+        x = self.conv_post(x)
+        x = torch.tanh(x)
+
+        return x
+
+    def remove_weight_norm(self):
+        print("Removing weight norm...")
+        for layer in self.ups:
+            remove_weight_norm(layer)
+        for layer in self.resblocks:
+            layer.remove_weight_norm()
+
+
+class ReferenceEncoder(nn.Module):
+    """
+    inputs --- [N, Ty/r, n_mels*r]  mels
+    outputs --- [N, ref_enc_gru_size]
+    """
+
+    def __init__(self, spec_channels, gin_channels=0, layernorm=True):
+        super().__init__()
+        self.spec_channels = spec_channels
+        ref_enc_filters = [32, 32, 64, 64, 128, 128]
+        K = len(ref_enc_filters)
+        filters = [1] + ref_enc_filters
+        convs = [
+            weight_norm(
+                nn.Conv2d(
+                    in_channels=filters[i],
+                    out_channels=filters[i + 1],
+                    kernel_size=(3, 3),
+                    stride=(2, 2),
+                    padding=(1, 1),
+                )
+            )
+            for i in range(K)
+        ]
+        self.convs = nn.ModuleList(convs)
+
+        out_channels = self.calculate_channels(spec_channels, 3, 2, 1, K)
+        self.gru = nn.GRU(
+            input_size=ref_enc_filters[-1] * out_channels,
+            hidden_size=256 // 2,
+            batch_first=True,
+        )
+        self.proj = nn.Linear(128, gin_channels)
+        if layernorm:
+            self.layernorm = nn.LayerNorm(self.spec_channels)
+        else:
+            self.layernorm = None
+
+    def forward(self, inputs, mask=None):
+        N = inputs.size(0)
+
+        out = inputs.view(N, 1, -1, self.spec_channels)  # [N, 1, Ty, n_freqs]
+        if self.layernorm is not None:
+            out = self.layernorm(out)
+
+        for conv in self.convs:
+            out = conv(out)
+            # out = wn(out)
+            out = F.relu(out)  # [N, 128, Ty//2^K, n_mels//2^K]
+
+        out = out.transpose(1, 2)  # [N, Ty//2^K, 128, n_mels//2^K]
+        T = out.size(1)
+        N = out.size(0)
+        out = out.contiguous().view(N, T, -1)  # [N, Ty//2^K, 128*n_mels//2^K]
+
+        self.gru.flatten_parameters()
+        memory, out = self.gru(out)  # out --- [1, N, 128]
+
+        return self.proj(out.squeeze(0))
+
+    def calculate_channels(self, L, kernel_size, stride, pad, n_convs):
+        for i in range(n_convs):
+            L = (L - kernel_size + 2 * pad) // stride + 1
+        return L
+
+
+class ResidualCouplingBlock(nn.Module):
+    def __init__(self,
+            channels,
+            hidden_channels,
+            kernel_size,
+            dilation_rate,
+            n_layers,
+            n_flows=4,
+            gin_channels=0):
+        super().__init__()
+        self.channels = channels
+        self.hidden_channels = hidden_channels
+        self.kernel_size = kernel_size
+        self.dilation_rate = dilation_rate
+        self.n_layers = n_layers
+        self.n_flows = n_flows
+        self.gin_channels = gin_channels
+
+        self.flows = nn.ModuleList()
+        for i in range(n_flows):
+            self.flows.append(modules.ResidualCouplingLayer(channels, hidden_channels, kernel_size, dilation_rate, n_layers, gin_channels=gin_channels, mean_only=True))
+            self.flows.append(modules.Flip())
+
+    def forward(self, x, x_mask, g=None, reverse=False):
+        if not reverse:
+            for flow in self.flows:
+                x, _ = flow(x, x_mask, g=g, reverse=reverse)
+        else:
+            for flow in reversed(self.flows):
+                x = flow(x, x_mask, g=g, reverse=reverse)
+        return x
+
+class SynthesizerTrn(nn.Module):
+    """
+    Synthesizer for Training
+    """
+
+    def __init__(
+        self,
+        n_vocab,
+        spec_channels,
+        inter_channels,
+        hidden_channels,
+        filter_channels,
+        n_heads,
+        n_layers,
+        kernel_size,
+        p_dropout,
+        resblock,
+        resblock_kernel_sizes,
+        resblock_dilation_sizes,
+        upsample_rates,
+        upsample_initial_channel,
+        upsample_kernel_sizes,
+        n_speakers=256,
+        gin_channels=256,
+        **kwargs
+    ):
+        super().__init__()
+
+        self.dec = Generator(
+            inter_channels,
+            resblock,
+            resblock_kernel_sizes,
+            resblock_dilation_sizes,
+            upsample_rates,
+            upsample_initial_channel,
+            upsample_kernel_sizes,
+            gin_channels=gin_channels,
+        )
+        self.enc_q = PosteriorEncoder(
+            spec_channels,
+            inter_channels,
+            hidden_channels,
+            5,
+            1,
+            16,
+            gin_channels=gin_channels,
+        )
+
+        self.flow = ResidualCouplingBlock(inter_channels, hidden_channels, 5, 1, 4, gin_channels=gin_channels)
+
+        self.n_speakers = n_speakers
+        if n_speakers == 0:
+            self.ref_enc = ReferenceEncoder(spec_channels, gin_channels)
+        else:
+            self.enc_p = TextEncoder(n_vocab,
+                inter_channels,
+                hidden_channels,
+                filter_channels,
+                n_heads,
+                n_layers,
+                kernel_size,
+                p_dropout)
+            self.sdp = StochasticDurationPredictor(hidden_channels, 192, 3, 0.5, 4, gin_channels=gin_channels)
+            self.dp = DurationPredictor(hidden_channels, 256, 3, 0.5, gin_channels=gin_channels)
+            self.emb_g = nn.Embedding(n_speakers, gin_channels)
+
+    def infer(self, x, x_lengths, sid=None, noise_scale=1, length_scale=1, noise_scale_w=1., sdp_ratio=0.2, max_len=None):
+        x, m_p, logs_p, x_mask = self.enc_p(x, x_lengths)
+        if self.n_speakers > 0:
+            g = self.emb_g(sid).unsqueeze(-1) # [b, h, 1]
+        else:
+            g = None
+
+        logw = self.sdp(x, x_mask, g=g, reverse=True, noise_scale=noise_scale_w) * sdp_ratio \
+            + self.dp(x, x_mask, g=g) * (1 - sdp_ratio)
+
+        w = torch.exp(logw) * x_mask * length_scale
+        w_ceil = torch.ceil(w)
+        y_lengths = torch.clamp_min(torch.sum(w_ceil, [1, 2]), 1).long()
+        y_mask = torch.unsqueeze(commons.sequence_mask(y_lengths, None), 1).to(x_mask.dtype)
+        attn_mask = torch.unsqueeze(x_mask, 2) * torch.unsqueeze(y_mask, -1)
+        attn = commons.generate_path(w_ceil, attn_mask)
+
+        m_p = torch.matmul(attn.squeeze(1), m_p.transpose(1, 2)).transpose(1, 2) # [b, t', t], [b, t, d] -> [b, d, t']
+        logs_p = torch.matmul(attn.squeeze(1), logs_p.transpose(1, 2)).transpose(1, 2) # [b, t', t], [b, t, d] -> [b, d, t']
+
+        z_p = m_p + torch.randn_like(m_p) * torch.exp(logs_p) * noise_scale
+        z = self.flow(z_p, y_mask, g=g, reverse=True)
+        o = self.dec((z * y_mask)[:,:,:max_len], g=g)
+        return o, attn, y_mask, (z, z_p, m_p, logs_p)
+
+    def voice_conversion(self, y, y_lengths, sid_src, sid_tgt, tau=1.0):
+        g_src = sid_src
+        g_tgt = sid_tgt
+        z, m_q, logs_q, y_mask = self.enc_q(y, y_lengths, g=g_src, tau=tau)
+        z_p = self.flow(z, y_mask, g=g_src)
+        z_hat = self.flow(z_p, y_mask, g=g_tgt, reverse=True)
+        o_hat = self.dec(z_hat * y_mask, g=g_tgt)
+        return o_hat, y_mask, (z, z_p, z_hat)
+
+</code>
+
+## modules.py
+
+<code>
+
+import math
+import torch
+from torch import nn
+from torch.nn import functional as F
+
+from torch.nn import Conv1d
+from torch.nn.utils import weight_norm, remove_weight_norm
+
+from openvoice import commons
+from openvoice.commons import init_weights, get_padding
+from openvoice.transforms import piecewise_rational_quadratic_transform
+from openvoice.attentions import Encoder
+
+LRELU_SLOPE = 0.1
+
+
+class LayerNorm(nn.Module):
+    def __init__(self, channels, eps=1e-5):
+        super().__init__()
+        self.channels = channels
+        self.eps = eps
+
+        self.gamma = nn.Parameter(torch.ones(channels))
+        self.beta = nn.Parameter(torch.zeros(channels))
+
+    def forward(self, x):
+        x = x.transpose(1, -1)
+        x = F.layer_norm(x, (self.channels,), self.gamma, self.beta, self.eps)
+        return x.transpose(1, -1)
+
+
+class ConvReluNorm(nn.Module):
+    def __init__(
+        self,
+        in_channels,
+        hidden_channels,
+        out_channels,
+        kernel_size,
+        n_layers,
+        p_dropout,
+    ):
+        super().__init__()
+        self.in_channels = in_channels
+        self.hidden_channels = hidden_channels
+        self.out_channels = out_channels
+        self.kernel_size = kernel_size
+        self.n_layers = n_layers
+        self.p_dropout = p_dropout
+        assert n_layers > 1, "Number of layers should be larger than 0."
+
+        self.conv_layers = nn.ModuleList()
+        self.norm_layers = nn.ModuleList()
+        self.conv_layers.append(
+            nn.Conv1d(
+                in_channels, hidden_channels, kernel_size, padding=kernel_size // 2
+            )
+        )
+        self.norm_layers.append(LayerNorm(hidden_channels))
+        self.relu_drop = nn.Sequential(nn.ReLU(), nn.Dropout(p_dropout))
+        for _ in range(n_layers - 1):
+            self.conv_layers.append(
+                nn.Conv1d(
+                    hidden_channels,
+                    hidden_channels,
+                    kernel_size,
+                    padding=kernel_size // 2,
+                )
+            )
+            self.norm_layers.append(LayerNorm(hidden_channels))
+        self.proj = nn.Conv1d(hidden_channels, out_channels, 1)
+        self.proj.weight.data.zero_()
+        self.proj.bias.data.zero_()
+
+    def forward(self, x, x_mask):
+        x_org = x
+        for i in range(self.n_layers):
+            x = self.conv_layers[i](x * x_mask)
+            x = self.norm_layers[i](x)
+            x = self.relu_drop(x)
+        x = x_org + self.proj(x)
+        return x * x_mask
+
+
+class DDSConv(nn.Module):
+    """
+    Dilated and Depth-Separable Convolution
+    """
+
+    def __init__(self, channels, kernel_size, n_layers, p_dropout=0.0):
+        super().__init__()
+        self.channels = channels
+        self.kernel_size = kernel_size
+        self.n_layers = n_layers
+        self.p_dropout = p_dropout
+
+        self.drop = nn.Dropout(p_dropout)
+        self.convs_sep = nn.ModuleList()
+        self.convs_1x1 = nn.ModuleList()
+        self.norms_1 = nn.ModuleList()
+        self.norms_2 = nn.ModuleList()
+        for i in range(n_layers):
+            dilation = kernel_size**i
+            padding = (kernel_size * dilation - dilation) // 2
+            self.convs_sep.append(
+                nn.Conv1d(
+                    channels,
+                    channels,
+                    kernel_size,
+                    groups=channels,
+                    dilation=dilation,
+                    padding=padding,
+                )
+            )
+            self.convs_1x1.append(nn.Conv1d(channels, channels, 1))
+            self.norms_1.append(LayerNorm(channels))
+            self.norms_2.append(LayerNorm(channels))
+
+    def forward(self, x, x_mask, g=None):
+        if g is not None:
+            x = x + g
+        for i in range(self.n_layers):
+            y = self.convs_sep[i](x * x_mask)
+            y = self.norms_1[i](y)
+            y = F.gelu(y)
+            y = self.convs_1x1[i](y)
+            y = self.norms_2[i](y)
+            y = F.gelu(y)
+            y = self.drop(y)
+            x = x + y
+        return x * x_mask
+
+
+class WN(torch.nn.Module):
+    def __init__(
+        self,
+        hidden_channels,
+        kernel_size,
+        dilation_rate,
+        n_layers,
+        gin_channels=0,
+        p_dropout=0,
+    ):
+        super(WN, self).__init__()
+        assert kernel_size % 2 == 1
+        self.hidden_channels = hidden_channels
+        self.kernel_size = (kernel_size,)
+        self.dilation_rate = dilation_rate
+        self.n_layers = n_layers
+        self.gin_channels = gin_channels
+        self.p_dropout = p_dropout
+
+        self.in_layers = torch.nn.ModuleList()
+        self.res_skip_layers = torch.nn.ModuleList()
+        self.drop = nn.Dropout(p_dropout)
+
+        if gin_channels != 0:
+            cond_layer = torch.nn.Conv1d(
+                gin_channels, 2 * hidden_channels * n_layers, 1
+            )
+            self.cond_layer = torch.nn.utils.weight_norm(cond_layer, name="weight")
+
+        for i in range(n_layers):
+            dilation = dilation_rate**i
+            padding = int((kernel_size * dilation - dilation) / 2)
+            in_layer = torch.nn.Conv1d(
+                hidden_channels,
+                2 * hidden_channels,
+                kernel_size,
+                dilation=dilation,
+                padding=padding,
+            )
+            in_layer = torch.nn.utils.weight_norm(in_layer, name="weight")
+            self.in_layers.append(in_layer)
+
+            # last one is not necessary
+            if i < n_layers - 1:
+                res_skip_channels = 2 * hidden_channels
+            else:
+                res_skip_channels = hidden_channels
+
+            res_skip_layer = torch.nn.Conv1d(hidden_channels, res_skip_channels, 1)
+            res_skip_layer = torch.nn.utils.weight_norm(res_skip_layer, name="weight")
+            self.res_skip_layers.append(res_skip_layer)
+
+    def forward(self, x, x_mask, g=None, **kwargs):
+        output = torch.zeros_like(x)
+        n_channels_tensor = torch.IntTensor([self.hidden_channels])
+
+        if g is not None:
+            g = self.cond_layer(g)
+
+        for i in range(self.n_layers):
+            x_in = self.in_layers[i](x)
+            if g is not None:
+                cond_offset = i * 2 * self.hidden_channels
+                g_l = g[:, cond_offset : cond_offset + 2 * self.hidden_channels, :]
+            else:
+                g_l = torch.zeros_like(x_in)
+
+            acts = commons.fused_add_tanh_sigmoid_multiply(x_in, g_l, n_channels_tensor)
+            acts = self.drop(acts)
+
+            res_skip_acts = self.res_skip_layers[i](acts)
+            if i < self.n_layers - 1:
+                res_acts = res_skip_acts[:, : self.hidden_channels, :]
+                x = (x + res_acts) * x_mask
+                output = output + res_skip_acts[:, self.hidden_channels :, :]
+            else:
+                output = output + res_skip_acts
+        return output * x_mask
+
+    def remove_weight_norm(self):
+        if self.gin_channels != 0:
+            torch.nn.utils.remove_weight_norm(self.cond_layer)
+        for l in self.in_layers:
+            torch.nn.utils.remove_weight_norm(l)
+        for l in self.res_skip_layers:
+            torch.nn.utils.remove_weight_norm(l)
+
+
+class ResBlock1(torch.nn.Module):
+    def __init__(self, channels, kernel_size=3, dilation=(1, 3, 5)):
+        super(ResBlock1, self).__init__()
+        self.convs1 = nn.ModuleList(
+            [
+                weight_norm(
+                    Conv1d(
+                        channels,
+                        channels,
+                        kernel_size,
+                        1,
+                        dilation=dilation[0],
+                        padding=get_padding(kernel_size, dilation[0]),
+                    )
+                ),
+                weight_norm(
+                    Conv1d(
+                        channels,
+                        channels,
+                        kernel_size,
+                        1,
+                        dilation=dilation[1],
+                        padding=get_padding(kernel_size, dilation[1]),
+                    )
+                ),
+                weight_norm(
+                    Conv1d(
+                        channels,
+                        channels,
+                        kernel_size,
+                        1,
+                        dilation=dilation[2],
+                        padding=get_padding(kernel_size, dilation[2]),
+                    )
+                ),
+            ]
+        )
+        self.convs1.apply(init_weights)
+
+        self.convs2 = nn.ModuleList(
+            [
+                weight_norm(
+                    Conv1d(
+                        channels,
+                        channels,
+                        kernel_size,
+                        1,
+                        dilation=1,
+                        padding=get_padding(kernel_size, 1),
+                    )
+                ),
+                weight_norm(
+                    Conv1d(
+                        channels,
+                        channels,
+                        kernel_size,
+                        1,
+                        dilation=1,
+                        padding=get_padding(kernel_size, 1),
+                    )
+                ),
+                weight_norm(
+                    Conv1d(
+                        channels,
+                        channels,
+                        kernel_size,
+                        1,
+                        dilation=1,
+                        padding=get_padding(kernel_size, 1),
+                    )
+                ),
+            ]
+        )
+        self.convs2.apply(init_weights)
+
+    def forward(self, x, x_mask=None):
+        for c1, c2 in zip(self.convs1, self.convs2):
+            xt = F.leaky_relu(x, LRELU_SLOPE)
+            if x_mask is not None:
+                xt = xt * x_mask
+            xt = c1(xt)
+            xt = F.leaky_relu(xt, LRELU_SLOPE)
+            if x_mask is not None:
+                xt = xt * x_mask
+            xt = c2(xt)
+            x = xt + x
+        if x_mask is not None:
+            x = x * x_mask
+        return x
+
+    def remove_weight_norm(self):
+        for l in self.convs1:
+            remove_weight_norm(l)
+        for l in self.convs2:
+            remove_weight_norm(l)
+
+
+class ResBlock2(torch.nn.Module):
+    def __init__(self, channels, kernel_size=3, dilation=(1, 3)):
+        super(ResBlock2, self).__init__()
+        self.convs = nn.ModuleList(
+            [
+                weight_norm(
+                    Conv1d(
+                        channels,
+                        channels,
+                        kernel_size,
+                        1,
+                        dilation=dilation[0],
+                        padding=get_padding(kernel_size, dilation[0]),
+                    )
+                ),
+                weight_norm(
+                    Conv1d(
+                        channels,
+                        channels,
+                        kernel_size,
+                        1,
+                        dilation=dilation[1],
+                        padding=get_padding(kernel_size, dilation[1]),
+                    )
+                ),
+            ]
+        )
+        self.convs.apply(init_weights)
+
+    def forward(self, x, x_mask=None):
+        for c in self.convs:
+            xt = F.leaky_relu(x, LRELU_SLOPE)
+            if x_mask is not None:
+                xt = xt * x_mask
+            xt = c(xt)
+            x = xt + x
+        if x_mask is not None:
+            x = x * x_mask
+        return x
+
+    def remove_weight_norm(self):
+        for l in self.convs:
+            remove_weight_norm(l)
+
+
+class Log(nn.Module):
+    def forward(self, x, x_mask, reverse=False, **kwargs):
+        if not reverse:
+            y = torch.log(torch.clamp_min(x, 1e-5)) * x_mask
+            logdet = torch.sum(-y, [1, 2])
+            return y, logdet
+        else:
+            x = torch.exp(x) * x_mask
+            return x
+
+
+class Flip(nn.Module):
+    def forward(self, x, *args, reverse=False, **kwargs):
+        x = torch.flip(x, [1])
+        if not reverse:
+            logdet = torch.zeros(x.size(0)).to(dtype=x.dtype, device=x.device)
+            return x, logdet
+        else:
+            return x
+
+
+class ElementwiseAffine(nn.Module):
+    def __init__(self, channels):
+        super().__init__()
+        self.channels = channels
+        self.m = nn.Parameter(torch.zeros(channels, 1))
+        self.logs = nn.Parameter(torch.zeros(channels, 1))
+
+    def forward(self, x, x_mask, reverse=False, **kwargs):
+        if not reverse:
+            y = self.m + torch.exp(self.logs) * x
+            y = y * x_mask
+            logdet = torch.sum(self.logs * x_mask, [1, 2])
+            return y, logdet
+        else:
+            x = (x - self.m) * torch.exp(-self.logs) * x_mask
+            return x
+
+
+class ResidualCouplingLayer(nn.Module):
+    def __init__(
+        self,
+        channels,
+        hidden_channels,
+        kernel_size,
+        dilation_rate,
+        n_layers,
+        p_dropout=0,
+        gin_channels=0,
+        mean_only=False,
+    ):
+        assert channels % 2 == 0, "channels should be divisible by 2"
+        super().__init__()
+        self.channels = channels
+        self.hidden_channels = hidden_channels
+        self.kernel_size = kernel_size
+        self.dilation_rate = dilation_rate
+        self.n_layers = n_layers
+        self.half_channels = channels // 2
+        self.mean_only = mean_only
+
+        self.pre = nn.Conv1d(self.half_channels, hidden_channels, 1)
+        self.enc = WN(
+            hidden_channels,
+            kernel_size,
+            dilation_rate,
+            n_layers,
+            p_dropout=p_dropout,
+            gin_channels=gin_channels,
+        )
+        self.post = nn.Conv1d(hidden_channels, self.half_channels * (2 - mean_only), 1)
+        self.post.weight.data.zero_()
+        self.post.bias.data.zero_()
+
+    def forward(self, x, x_mask, g=None, reverse=False):
+        x0, x1 = torch.split(x, [self.half_channels] * 2, 1)
+        h = self.pre(x0) * x_mask
+        h = self.enc(h, x_mask, g=g)
+        stats = self.post(h) * x_mask
+        if not self.mean_only:
+            m, logs = torch.split(stats, [self.half_channels] * 2, 1)
+        else:
+            m = stats
+            logs = torch.zeros_like(m)
+
+        if not reverse:
+            x1 = m + x1 * torch.exp(logs) * x_mask
+            x = torch.cat([x0, x1], 1)
+            logdet = torch.sum(logs, [1, 2])
+            return x, logdet
+        else:
+            x1 = (x1 - m) * torch.exp(-logs) * x_mask
+            x = torch.cat([x0, x1], 1)
+            return x
+
+
+class ConvFlow(nn.Module):
+    def __init__(
+        self,
+        in_channels,
+        filter_channels,
+        kernel_size,
+        n_layers,
+        num_bins=10,
+        tail_bound=5.0,
+    ):
+        super().__init__()
+        self.in_channels = in_channels
+        self.filter_channels = filter_channels
+        self.kernel_size = kernel_size
+        self.n_layers = n_layers
+        self.num_bins = num_bins
+        self.tail_bound = tail_bound
+        self.half_channels = in_channels // 2
+
+        self.pre = nn.Conv1d(self.half_channels, filter_channels, 1)
+        self.convs = DDSConv(filter_channels, kernel_size, n_layers, p_dropout=0.0)
+        self.proj = nn.Conv1d(
+            filter_channels, self.half_channels * (num_bins * 3 - 1), 1
+        )
+        self.proj.weight.data.zero_()
+        self.proj.bias.data.zero_()
+
+    def forward(self, x, x_mask, g=None, reverse=False):
+        x0, x1 = torch.split(x, [self.half_channels] * 2, 1)
+        h = self.pre(x0)
+        h = self.convs(h, x_mask, g=g)
+        h = self.proj(h) * x_mask
+
+        b, c, t = x0.shape
+        h = h.reshape(b, c, -1, t).permute(0, 1, 3, 2)  # [b, cx?, t] -> [b, c, t, ?]
+
+        unnormalized_widths = h[..., : self.num_bins] / math.sqrt(self.filter_channels)
+        unnormalized_heights = h[..., self.num_bins : 2 * self.num_bins] / math.sqrt(
+            self.filter_channels
+        )
+        unnormalized_derivatives = h[..., 2 * self.num_bins :]
+
+        x1, logabsdet = piecewise_rational_quadratic_transform(
+            x1,
+            unnormalized_widths,
+            unnormalized_heights,
+            unnormalized_derivatives,
+            inverse=reverse,
+            tails="linear",
+            tail_bound=self.tail_bound,
+        )
+
+        x = torch.cat([x0, x1], 1) * x_mask
+        logdet = torch.sum(logabsdet * x_mask, [1, 2])
+        if not reverse:
+            return x, logdet
+        else:
+            return x
+
+
+class TransformerCouplingLayer(nn.Module):
+    def __init__(
+        self,
+        channels,
+        hidden_channels,
+        kernel_size,
+        n_layers,
+        n_heads,
+        p_dropout=0,
+        filter_channels=0,
+        mean_only=False,
+        wn_sharing_parameter=None,
+        gin_channels=0,
+    ):
+        assert n_layers == 3, n_layers
+        assert channels % 2 == 0, "channels should be divisible by 2"
+        super().__init__()
+        self.channels = channels
+        self.hidden_channels = hidden_channels
+        self.kernel_size = kernel_size
+        self.n_layers = n_layers
+        self.half_channels = channels // 2
+        self.mean_only = mean_only
+
+        self.pre = nn.Conv1d(self.half_channels, hidden_channels, 1)
+        self.enc = (
+            Encoder(
+                hidden_channels,
+                filter_channels,
+                n_heads,
+                n_layers,
+                kernel_size,
+                p_dropout,
+                isflow=True,
+                gin_channels=gin_channels,
+            )
+            if wn_sharing_parameter is None
+            else wn_sharing_parameter
+        )
+        self.post = nn.Conv1d(hidden_channels, self.half_channels * (2 - mean_only), 1)
+        self.post.weight.data.zero_()
+        self.post.bias.data.zero_()
+
+    def forward(self, x, x_mask, g=None, reverse=False):
+        x0, x1 = torch.split(x, [self.half_channels] * 2, 1)
+        h = self.pre(x0) * x_mask
+        h = self.enc(h, x_mask, g=g)
+        stats = self.post(h) * x_mask
+        if not self.mean_only:
+            m, logs = torch.split(stats, [self.half_channels] * 2, 1)
+        else:
+            m = stats
+            logs = torch.zeros_like(m)
+
+        if not reverse:
+            x1 = m + x1 * torch.exp(logs) * x_mask
+            x = torch.cat([x0, x1], 1)
+            logdet = torch.sum(logs, [1, 2])
+            return x, logdet
+        else:
+            x1 = (x1 - m) * torch.exp(-logs) * x_mask
+            x = torch.cat([x0, x1], 1)
+            return x
+
+        x1, logabsdet = piecewise_rational_quadratic_transform(
+            x1,
+            unnormalized_widths,
+            unnormalized_heights,
+            unnormalized_derivatives,
+            inverse=reverse,
+            tails="linear",
+            tail_bound=self.tail_bound,
+        )
+
+        x = torch.cat([x0, x1], 1) * x_mask
+        logdet = torch.sum(logabsdet * x_mask, [1, 2])
+        if not reverse:
+            return x, logdet
+        else:
+            return x
+
+</code>
+
+## openvoice_app.py
+
+<code>
+
+import os
+import torch
+import argparse
+import gradio as gr
+from zipfile import ZipFile
+import langid
+from openvoice import se_extractor
+from openvoice.api import BaseSpeakerTTS, ToneColorConverter
+
+parser = argparse.ArgumentParser()
+parser.add_argument("--share", action='store_true', default=False, help="make link public")
+args = parser.parse_args()
+
+en_ckpt_base = 'checkpoints/base_speakers/EN'
+zh_ckpt_base = 'checkpoints/base_speakers/ZH'
+ckpt_converter = 'checkpoints/converter'
+device = 'cuda' if torch.cuda.is_available() else 'cpu'
+output_dir = 'outputs'
+os.makedirs(output_dir, exist_ok=True)
+
+# load models
+en_base_speaker_tts = BaseSpeakerTTS(f'{en_ckpt_base}/config.json', device=device)
+en_base_speaker_tts.load_ckpt(f'{en_ckpt_base}/checkpoint.pth')
+zh_base_speaker_tts = BaseSpeakerTTS(f'{zh_ckpt_base}/config.json', device=device)
+zh_base_speaker_tts.load_ckpt(f'{zh_ckpt_base}/checkpoint.pth')
+tone_color_converter = ToneColorConverter(f'{ckpt_converter}/config.json', device=device)
+tone_color_converter.load_ckpt(f'{ckpt_converter}/checkpoint.pth')
+
+# load speaker embeddings
+en_source_default_se = torch.load(f'{en_ckpt_base}/en_default_se.pth').to(device)
+en_source_style_se = torch.load(f'{en_ckpt_base}/en_style_se.pth').to(device)
+zh_source_se = torch.load(f'{zh_ckpt_base}/zh_default_se.pth').to(device)
+
+# This online demo mainly supports English and Chinese
+supported_languages = ['zh', 'en']
+
+def predict(prompt, style, audio_file_pth, agree):
+    # initialize a empty info
+    text_hint = ''
+    # agree with the terms
+    if agree == False:
+        text_hint += '[ERROR] Please accept the Terms & Condition!\n'
+        gr.Warning("Please accept the Terms & Condition!")
+        return (
+            text_hint,
+            None,
+            None,
+        )
+
+    # first detect the input language
+    language_predicted = langid.classify(prompt)[0].strip()  
+    print(f"Detected language:{language_predicted}")
+
+    if language_predicted not in supported_languages:
+        text_hint += f"[ERROR] The detected language {language_predicted} for your input text is not in our Supported Languages: {supported_languages}\n"
+        gr.Warning(
+            f"The detected language {language_predicted} for your input text is not in our Supported Languages: {supported_languages}"
+        )
+
+        return (
+            text_hint,
+            None,
+            None,
+        )
+    
+    if language_predicted == "zh":
+        tts_model = zh_base_speaker_tts
+        source_se = zh_source_se
+        language = 'Chinese'
+        if style not in ['default']:
+            text_hint += f"[ERROR] The style {style} is not supported for Chinese, which should be in ['default']\n"
+            gr.Warning(f"The style {style} is not supported for Chinese, which should be in ['default']")
+            return (
+                text_hint,
+                None,
+                None,
+            )
+
+    else:
+        tts_model = en_base_speaker_tts
+        if style == 'default':
+            source_se = en_source_default_se
+        else:
+            source_se = en_source_style_se
+        language = 'English'
+        if style not in ['default', 'whispering', 'shouting', 'excited', 'cheerful', 'terrified', 'angry', 'sad', 'friendly']:
+            text_hint += f"[ERROR] The style {style} is not supported for English, which should be in ['default', 'whispering', 'shouting', 'excited', 'cheerful', 'terrified', 'angry', 'sad', 'friendly']\n"
+            gr.Warning(f"The style {style} is not supported for English, which should be in ['default', 'whispering', 'shouting', 'excited', 'cheerful', 'terrified', 'angry', 'sad', 'friendly']")
+            return (
+                text_hint,
+                None,
+                None,
+            )
+
+    speaker_wav = audio_file_pth
+
+    if len(prompt) < 2:
+        text_hint += f"[ERROR] Please give a longer prompt text \n"
+        gr.Warning("Please give a longer prompt text")
+        return (
+            text_hint,
+            None,
+            None,
+        )
+    if len(prompt) > 200:
+        text_hint += f"[ERROR] Text length limited to 200 characters for this demo, please try shorter text. You can clone our open-source repo and try for your usage \n"
+        gr.Warning(
+            "Text length limited to 200 characters for this demo, please try shorter text. You can clone our open-source repo for your usage"
+        )
+        return (
+            text_hint,
+            None,
+            None,
+        )
+    
+    # note diffusion_conditioning not used on hifigan (default mode), it will be empty but need to pass it to model.inference
+    try:
+        target_se, audio_name = se_extractor.get_se(speaker_wav, tone_color_converter, target_dir='processed', vad=True)
+    except Exception as e:
+        text_hint += f"[ERROR] Get target tone color error {str(e)} \n"
+        gr.Warning(
+            "[ERROR] Get target tone color error {str(e)} \n"
+        )
+        return (
+            text_hint,
+            None,
+            None,
+        )
+
+    src_path = f'{output_dir}/tmp.wav'
+    tts_model.tts(prompt, src_path, speaker=style, language=language)
+
+    save_path = f'{output_dir}/output.wav'
+    # Run the tone color converter
+    encode_message = "@MyShell"
+    tone_color_converter.convert(
+        audio_src_path=src_path, 
+        src_se=source_se, 
+        tgt_se=target_se, 
+        output_path=save_path,
+        message=encode_message)
+
+    text_hint += f'''Get response successfully \n'''
+
+    return (
+        text_hint,
+        save_path,
+        speaker_wav,
+    )
+
+
+
+title = "MyShell OpenVoice"
+
+description = """
+We introduce OpenVoice, a versatile instant voice cloning approach that requires only a short audio clip from the reference speaker to replicate their voice and generate speech in multiple languages. OpenVoice enables granular control over voice styles, including emotion, accent, rhythm, pauses, and intonation, in addition to replicating the tone color of the reference speaker. OpenVoice also achieves zero-shot cross-lingual voice cloning for languages not included in the massive-speaker training set.
+"""
+
+markdown_table = """
+<div align="center" style="margin-bottom: 10px;">
+
+|               |               |               |
+| :-----------: | :-----------: | :-----------: | 
+| **OpenSource Repo** | **Project Page** | **Join the Community** |        
+| <div style='text-align: center;'><a style="display:inline-block,align:center" href='https://github.com/myshell-ai/OpenVoice'><img src='https://img.shields.io/github/stars/myshell-ai/OpenVoice?style=social' /></a></div> | [OpenVoice](https://research.myshell.ai/open-voice) | [![Discord](https://img.shields.io/discord/1122227993805336617?color=%239B59B6&label=%20Discord%20)](https://discord.gg/myshell) |
+
+</div>
+"""
+
+markdown_table_v2 = """
+<div align="center" style="margin-bottom: 2px;">
+
+|               |               |               |              |
+| :-----------: | :-----------: | :-----------: | :-----------: | 
+| **OpenSource Repo** | <div style='text-align: center;'><a style="display:inline-block,align:center" href='https://github.com/myshell-ai/OpenVoice'><img src='https://img.shields.io/github/stars/myshell-ai/OpenVoice?style=social' /></a></div> |  **Project Page** |  [OpenVoice](https://research.myshell.ai/open-voice) |     
+
+| | |
+| :-----------: | :-----------: |
+**Join the Community** |   [![Discord](https://img.shields.io/discord/1122227993805336617?color=%239B59B6&label=%20Discord%20)](https://discord.gg/myshell) |
+
+</div>
+"""
+content = """
+<div>
+  <strong>If the generated voice does not sound like the reference voice, please refer to <a href='https://github.com/myshell-ai/OpenVoice/blob/main/docs/QA.md'>this QnA</a>.</strong> <strong>For multi-lingual & cross-lingual examples, please refer to <a href='https://github.com/myshell-ai/OpenVoice/blob/main/demo_part2.ipynb'>this jupyter notebook</a>.</strong>
+  This online demo mainly supports <strong>English</strong>. The <em>default</em> style also supports <strong>Chinese</strong>. But OpenVoice can adapt to any other language as long as a base speaker is provided.
+</div>
+"""
+wrapped_markdown_content = f"<div style='border: 1px solid #000; padding: 10px;'>{content}</div>"
+
+
+examples = [
+    [
+        "今天天气真好，我们一起出去吃饭吧。",
+        'default',
+        "resources/demo_speaker1.mp3",
+        True,
+    ],[
+        "This audio is generated by open voice with a half-performance model.",
+        'whispering',
+        "resources/demo_speaker2.mp3",
+        True,
+    ],
+    [
+        "He hoped there would be stew for dinner, turnips and carrots and bruised potatoes and fat mutton pieces to be ladled out in thick, peppered, flour-fattened sauce.",
+        'sad',
+        "resources/demo_speaker0.mp3",
+        True,
+    ],
+]
+
+with gr.Blocks(analytics_enabled=False) as demo:
+
+    with gr.Row():
+        with gr.Column():
+            with gr.Row():
+                gr.Markdown(
+                    """
+                    ## <img src="https://huggingface.co/spaces/myshell-ai/OpenVoice/raw/main/logo.jpg" height="40"/>
+                    """
+                )
+            with gr.Row():    
+                gr.Markdown(markdown_table_v2)
+            with gr.Row():
+                gr.Markdown(description)
+        with gr.Column():
+            gr.Video('https://github.com/myshell-ai/OpenVoice/assets/40556743/3cba936f-82bf-476c-9e52-09f0f417bb2f', autoplay=True)
+            
+    with gr.Row():
+        gr.HTML(wrapped_markdown_content)
+
+    with gr.Row():
+        with gr.Column():
+            input_text_gr = gr.Textbox(
+                label="Text Prompt",
+                info="One or two sentences at a time is better. Up to 200 text characters.",
+                value="He hoped there would be stew for dinner, turnips and carrots and bruised potatoes and fat mutton pieces to be ladled out in thick, peppered, flour-fattened sauce.",
+            )
+            style_gr = gr.Dropdown(
+                label="Style",
+                info="Select a style of output audio for the synthesised speech. (Chinese only support 'default' now)",
+                choices=['default', 'whispering', 'cheerful', 'terrified', 'angry', 'sad', 'friendly'],
+                max_choices=1,
+                value="default",
+            )
+            ref_gr = gr.Audio(
+                label="Reference Audio",
+                info="Click on the ✎ button to upload your own target speaker audio",
+                type="filepath",
+                value="resources/demo_speaker2.mp3",
+            )
+            tos_gr = gr.Checkbox(
+                label="Agree",
+                value=False,
+                info="I agree to the terms of the cc-by-nc-4.0 license-: https://github.com/myshell-ai/OpenVoice/blob/main/LICENSE",
+            )
+
+            tts_button = gr.Button("Send", elem_id="send-btn", visible=True)
+
+
+        with gr.Column():
+            out_text_gr = gr.Text(label="Info")
+            audio_gr = gr.Audio(label="Synthesised Audio", autoplay=True)
+            ref_audio_gr = gr.Audio(label="Reference Audio Used")
+
+            gr.Examples(examples,
+                        label="Examples",
+                        inputs=[input_text_gr, style_gr, ref_gr, tos_gr],
+                        outputs=[out_text_gr, audio_gr, ref_audio_gr],
+                        fn=predict,
+                        cache_examples=False,)
+            tts_button.click(predict, [input_text_gr, style_gr, ref_gr, tos_gr], outputs=[out_text_gr, audio_gr, ref_audio_gr])
+
+demo.queue()  
+demo.launch(debug=True, show_api=True, share=args.share)
+
+</code>
+
+## se_extractor.py
+
+<code>
+
+import os
+import glob
+import torch
+import hashlib
+import librosa
+import base64
+from glob import glob
+import numpy as np
+from pydub import AudioSegment
+from faster_whisper import WhisperModel
+import hashlib
+import base64
+import librosa
+from whisper_timestamped.transcribe import get_audio_tensor, get_vad_segments
+
+model_size = "medium"
+# Run on GPU with FP16
+model = None
+def split_audio_whisper(audio_path, audio_name, target_dir='processed'):
+    global model
+    if model is None:
+        model = WhisperModel(model_size, device="cuda", compute_type="float16")
+    audio = AudioSegment.from_file(audio_path)
+    max_len = len(audio)
+
+    target_folder = os.path.join(target_dir, audio_name)
+    
+    segments, info = model.transcribe(audio_path, beam_size=5, word_timestamps=True)
+    segments = list(segments)    
+
+    # create directory
+    os.makedirs(target_folder, exist_ok=True)
+    wavs_folder = os.path.join(target_folder, 'wavs')
+    os.makedirs(wavs_folder, exist_ok=True)
+
+    # segments
+    s_ind = 0
+    start_time = None
+    
+    for k, w in enumerate(segments):
+        # process with the time
+        if k == 0:
+            start_time = max(0, w.start)
+
+        end_time = w.end
+
+        # calculate confidence
+        if len(w.words) > 0:
+            confidence = sum([s.probability for s in w.words]) / len(w.words)
+        else:
+            confidence = 0.
+        # clean text
+        text = w.text.replace('...', '')
+
+        # left 0.08s for each audios
+        audio_seg = audio[int( start_time * 1000) : min(max_len, int(end_time * 1000) + 80)]
+
+        # segment file name
+        fname = f"{audio_name}_seg{s_ind}.wav"
+
+        # filter out the segment shorter than 1.5s and longer than 20s
+        save = audio_seg.duration_seconds > 1.5 and \
+                audio_seg.duration_seconds < 20. and \
+                len(text) >= 2 and len(text) < 200 
+
+        if save:
+            output_file = os.path.join(wavs_folder, fname)
+            audio_seg.export(output_file, format='wav')
+
+        if k < len(segments) - 1:
+            start_time = max(0, segments[k+1].start - 0.08)
+
+        s_ind = s_ind + 1
+    return wavs_folder
+
+
+def split_audio_vad(audio_path, audio_name, target_dir, split_seconds=10.0):
+    SAMPLE_RATE = 16000
+    audio_vad = get_audio_tensor(audio_path)
+    segments = get_vad_segments(
+        audio_vad,
+        output_sample=True,
+        min_speech_duration=0.1,
+        min_silence_duration=1,
+        method="silero",
+    )
+    segments = [(seg["start"], seg["end"]) for seg in segments]
+    segments = [(float(s) / SAMPLE_RATE, float(e) / SAMPLE_RATE) for s,e in segments]
+    print(segments)
+    audio_active = AudioSegment.silent(duration=0)
+    audio = AudioSegment.from_file(audio_path)
+
+    for start_time, end_time in segments:
+        audio_active += audio[int( start_time * 1000) : int(end_time * 1000)]
+    
+    audio_dur = audio_active.duration_seconds
+    print(f'after vad: dur = {audio_dur}')
+    target_folder = os.path.join(target_dir, audio_name)
+    wavs_folder = os.path.join(target_folder, 'wavs')
+    os.makedirs(wavs_folder, exist_ok=True)
+    start_time = 0.
+    count = 0
+    num_splits = int(np.round(audio_dur / split_seconds))
+    assert num_splits > 0, 'input audio is too short'
+    interval = audio_dur / num_splits
+
+    for i in range(num_splits):
+        end_time = min(start_time + interval, audio_dur)
+        if i == num_splits - 1:
+            end_time = audio_dur
+        output_file = f"{wavs_folder}/{audio_name}_seg{count}.wav"
+        audio_seg = audio_active[int(start_time * 1000): int(end_time * 1000)]
+        audio_seg.export(output_file, format='wav')
+        start_time = end_time
+        count += 1
+    return wavs_folder
+
+def hash_numpy_array(audio_path):
+    array, _ = librosa.load(audio_path, sr=None, mono=True)
+    # Convert the array to bytes
+    array_bytes = array.tobytes()
+    # Calculate the hash of the array bytes
+    hash_object = hashlib.sha256(array_bytes)
+    hash_value = hash_object.digest()
+    # Convert the hash value to base64
+    base64_value = base64.b64encode(hash_value)
+    return base64_value.decode('utf-8')[:16].replace('/', '_^')
+
+def get_se(audio_path, vc_model, target_dir='processed', vad=True):
+    device = vc_model.device
+
+    audio_name = f"{os.path.basename(audio_path).rsplit('.', 1)[0]}_{hash_numpy_array(audio_path)}"
+    se_path = os.path.join(target_dir, audio_name, 'se.pth')
+
+    if os.path.isfile(se_path):
+        se = torch.load(se_path).to(device)
+        return se, audio_name
+    if os.path.isdir(audio_path):
+        wavs_folder = audio_path
+    elif vad:
+        wavs_folder = split_audio_vad(audio_path, target_dir=target_dir, audio_name=audio_name)
+    else:
+        wavs_folder = split_audio_whisper(audio_path, target_dir=target_dir, audio_name=audio_name)
+    
+    audio_segs = glob(f'{wavs_folder}/*.wav')
+    if len(audio_segs) == 0:
+        raise NotImplementedError('No audio segments found!')
+    
+    return vc_model.extract_se(audio_segs, se_save_path=se_path), audio_name
+
+
+</code>
+
+## text/__init__.py
+
+<code>
+
+""" from https://github.com/keithito/tacotron """
+from openvoice.text import cleaners
+from openvoice.text.symbols import symbols
+
+
+# Mappings from symbol to numeric ID and vice versa:
+_symbol_to_id = {s: i for i, s in enumerate(symbols)}
+_id_to_symbol = {i: s for i, s in enumerate(symbols)}
+
+
+def text_to_sequence(text, symbols, cleaner_names):
+  '''Converts a string of text to a sequence of IDs corresponding to the symbols in the text.
+    Args:
+      text: string to convert to a sequence
+      cleaner_names: names of the cleaner functions to run the text through
+    Returns:
+      List of integers corresponding to the symbols in the text
+  '''
+  sequence = []
+  symbol_to_id = {s: i for i, s in enumerate(symbols)}
+  clean_text = _clean_text(text, cleaner_names)
+  print(clean_text)
+  print(f" length:{len(clean_text)}")
+  for symbol in clean_text:
+    if symbol not in symbol_to_id.keys():
+      continue
+    symbol_id = symbol_to_id[symbol]
+    sequence += [symbol_id]
+  print(f" length:{len(sequence)}")
+  return sequence
+
+
+def cleaned_text_to_sequence(cleaned_text, symbols):
+  '''Converts a string of text to a sequence of IDs corresponding to the symbols in the text.
+    Args:
+      text: string to convert to a sequence
+    Returns:
+      List of integers corresponding to the symbols in the text
+  '''
+  symbol_to_id = {s: i for i, s in enumerate(symbols)}
+  sequence = [symbol_to_id[symbol] for symbol in cleaned_text if symbol in symbol_to_id.keys()]
+  return sequence
+
+
+
+from openvoice.text.symbols import language_tone_start_map
+def cleaned_text_to_sequence_vits2(cleaned_text, tones, language, symbols, languages):
+    """Converts a string of text to a sequence of IDs corresponding to the symbols in the text.
+    Args:
+      text: string to convert to a sequence
+    Returns:
+      List of integers corresponding to the symbols in the text
+    """
+    symbol_to_id = {s: i for i, s in enumerate(symbols)}
+    language_id_map = {s: i for i, s in enumerate(languages)}
+    phones = [symbol_to_id[symbol] for symbol in cleaned_text]
+    tone_start = language_tone_start_map[language]
+    tones = [i + tone_start for i in tones]
+    lang_id = language_id_map[language]
+    lang_ids = [lang_id for i in phones]
+    return phones, tones, lang_ids
+
+
+def sequence_to_text(sequence):
+  '''Converts a sequence of IDs back to a string'''
+  result = ''
+  for symbol_id in sequence:
+    s = _id_to_symbol[symbol_id]
+    result += s
+  return result
+
+
+def _clean_text(text, cleaner_names):
+  for name in cleaner_names:
+    cleaner = getattr(cleaners, name)
+    if not cleaner:
+      raise Exception('Unknown cleaner: %s' % name)
+    text = cleaner(text)
+  return text
+
+</code>
+
+## text/cleaners.py
+
+<code>
+
+import re
+from openvoice.text.english import english_to_lazy_ipa, english_to_ipa2, english_to_lazy_ipa2
+from openvoice.text.mandarin import number_to_chinese, chinese_to_bopomofo, latin_to_bopomofo, chinese_to_romaji, chinese_to_lazy_ipa, chinese_to_ipa, chinese_to_ipa2
+
+def cjke_cleaners2(text):
+    text = re.sub(r'\[ZH\](.*?)\[ZH\]',
+                  lambda x: chinese_to_ipa(x.group(1))+' ', text)
+    text = re.sub(r'\[JA\](.*?)\[JA\]',
+                  lambda x: japanese_to_ipa2(x.group(1))+' ', text)
+    text = re.sub(r'\[KO\](.*?)\[KO\]',
+                  lambda x: korean_to_ipa(x.group(1))+' ', text)
+    text = re.sub(r'\[EN\](.*?)\[EN\]',
+                  lambda x: english_to_ipa2(x.group(1))+' ', text)
+    text = re.sub(r'\s+$', '', text)
+    text = re.sub(r'([^\.,!\?\-…~])$', r'\1.', text)
+    return text
+</code>
+
+## text/english.py
+
+<code>
+
+""" from https://github.com/keithito/tacotron """
+
+'''
+Cleaners are transformations that run over the input text at both training and eval time.
+
+Cleaners can be selected by passing a comma-delimited list of cleaner names as the "cleaners"
+hyperparameter. Some cleaners are English-specific. You'll typically want to use:
+  1. "english_cleaners" for English text
+  2. "transliteration_cleaners" for non-English text that can be transliterated to ASCII using
+     the Unidecode library (https://pypi.python.org/pypi/Unidecode)
+  3. "basic_cleaners" if you do not want to transliterate (in this case, you should also update
+     the symbols in symbols.py to match your data).
+'''
+
+
+# Regular expression matching whitespace:
+
+
+import re
+import inflect
+from unidecode import unidecode
+import eng_to_ipa as ipa
+_inflect = inflect.engine()
+_comma_number_re = re.compile(r'([0-9][0-9\,]+[0-9])')
+_decimal_number_re = re.compile(r'([0-9]+\.[0-9]+)')
+_pounds_re = re.compile(r'£([0-9\,]*[0-9]+)')
+_dollars_re = re.compile(r'\$([0-9\.\,]*[0-9]+)')
+_ordinal_re = re.compile(r'[0-9]+(st|nd|rd|th)')
+_number_re = re.compile(r'[0-9]+')
+
+# List of (regular expression, replacement) pairs for abbreviations:
+_abbreviations = [(re.compile('\\b%s\\.' % x[0], re.IGNORECASE), x[1]) for x in [
+    ('mrs', 'misess'),
+    ('mr', 'mister'),
+    ('dr', 'doctor'),
+    ('st', 'saint'),
+    ('co', 'company'),
+    ('jr', 'junior'),
+    ('maj', 'major'),
+    ('gen', 'general'),
+    ('drs', 'doctors'),
+    ('rev', 'reverend'),
+    ('lt', 'lieutenant'),
+    ('hon', 'honorable'),
+    ('sgt', 'sergeant'),
+    ('capt', 'captain'),
+    ('esq', 'esquire'),
+    ('ltd', 'limited'),
+    ('col', 'colonel'),
+    ('ft', 'fort'),
+]]
+
+
+# List of (ipa, lazy ipa) pairs:
+_lazy_ipa = [(re.compile('%s' % x[0]), x[1]) for x in [
+    ('r', 'ɹ'),
+    ('æ', 'e'),
+    ('ɑ', 'a'),
+    ('ɔ', 'o'),
+    ('ð', 'z'),
+    ('θ', 's'),
+    ('ɛ', 'e'),
+    ('ɪ', 'i'),
+    ('ʊ', 'u'),
+    ('ʒ', 'ʥ'),
+    ('ʤ', 'ʥ'),
+    ('ˈ', '↓'),
+]]
+
+# List of (ipa, lazy ipa2) pairs:
+_lazy_ipa2 = [(re.compile('%s' % x[0]), x[1]) for x in [
+    ('r', 'ɹ'),
+    ('ð', 'z'),
+    ('θ', 's'),
+    ('ʒ', 'ʑ'),
+    ('ʤ', 'dʑ'),
+    ('ˈ', '↓'),
+]]
+
+# List of (ipa, ipa2) pairs
+_ipa_to_ipa2 = [(re.compile('%s' % x[0]), x[1]) for x in [
+    ('r', 'ɹ'),
+    ('ʤ', 'dʒ'),
+    ('ʧ', 'tʃ')
+]]
+
+
+def expand_abbreviations(text):
+    for regex, replacement in _abbreviations:
+        text = re.sub(regex, replacement, text)
+    return text
+
+
+def collapse_whitespace(text):
+    return re.sub(r'\s+', ' ', text)
+
+
+def _remove_commas(m):
+    return m.group(1).replace(',', '')
+
+
+def _expand_decimal_point(m):
+    return m.group(1).replace('.', ' point ')
+
+
+def _expand_dollars(m):
+    match = m.group(1)
+    parts = match.split('.')
+    if len(parts) > 2:
+        return match + ' dollars'  # Unexpected format
+    dollars = int(parts[0]) if parts[0] else 0
+    cents = int(parts[1]) if len(parts) > 1 and parts[1] else 0
+    if dollars and cents:
+        dollar_unit = 'dollar' if dollars == 1 else 'dollars'
+        cent_unit = 'cent' if cents == 1 else 'cents'
+        return '%s %s, %s %s' % (dollars, dollar_unit, cents, cent_unit)
+    elif dollars:
+        dollar_unit = 'dollar' if dollars == 1 else 'dollars'
+        return '%s %s' % (dollars, dollar_unit)
+    elif cents:
+        cent_unit = 'cent' if cents == 1 else 'cents'
+        return '%s %s' % (cents, cent_unit)
+    else:
+        return 'zero dollars'
+
+
+def _expand_ordinal(m):
+    return _inflect.number_to_words(m.group(0))
+
+
+def _expand_number(m):
+    num = int(m.group(0))
+    if num > 1000 and num < 3000:
+        if num == 2000:
+            return 'two thousand'
+        elif num > 2000 and num < 2010:
+            return 'two thousand ' + _inflect.number_to_words(num % 100)
+        elif num % 100 == 0:
+            return _inflect.number_to_words(num // 100) + ' hundred'
+        else:
+            return _inflect.number_to_words(num, andword='', zero='oh', group=2).replace(', ', ' ')
+    else:
+        return _inflect.number_to_words(num, andword='')
+
+
+def normalize_numbers(text):
+    text = re.sub(_comma_number_re, _remove_commas, text)
+    text = re.sub(_pounds_re, r'\1 pounds', text)
+    text = re.sub(_dollars_re, _expand_dollars, text)
+    text = re.sub(_decimal_number_re, _expand_decimal_point, text)
+    text = re.sub(_ordinal_re, _expand_ordinal, text)
+    text = re.sub(_number_re, _expand_number, text)
+    return text
+
+
+def mark_dark_l(text):
+    return re.sub(r'l([^aeiouæɑɔəɛɪʊ ]*(?: |$))', lambda x: 'ɫ'+x.group(1), text)
+
+
+def english_to_ipa(text):
+    text = unidecode(text).lower()
+    text = expand_abbreviations(text)
+    text = normalize_numbers(text)
+    phonemes = ipa.convert(text)
+    phonemes = collapse_whitespace(phonemes)
+    return phonemes
+
+
+def english_to_lazy_ipa(text):
+    text = english_to_ipa(text)
+    for regex, replacement in _lazy_ipa:
+        text = re.sub(regex, replacement, text)
+    return text
+
+
+def english_to_ipa2(text):
+    text = english_to_ipa(text)
+    text = mark_dark_l(text)
+    for regex, replacement in _ipa_to_ipa2:
+        text = re.sub(regex, replacement, text)
+    return text.replace('...', '…')
+
+
+def english_to_lazy_ipa2(text):
+    text = english_to_ipa(text)
+    for regex, replacement in _lazy_ipa2:
+        text = re.sub(regex, replacement, text)
+    return text
+
+</code>
+
+## text/mandarin.py
+
+<code>
+
+import os
+import sys
+import re
+from pypinyin import lazy_pinyin, BOPOMOFO
+import jieba
+import cn2an
+import logging
+
+
+# List of (Latin alphabet, bopomofo) pairs:
+_latin_to_bopomofo = [(re.compile('%s' % x[0], re.IGNORECASE), x[1]) for x in [
+    ('a', 'ㄟˉ'),
+    ('b', 'ㄅㄧˋ'),
+    ('c', 'ㄙㄧˉ'),
+    ('d', 'ㄉㄧˋ'),
+    ('e', 'ㄧˋ'),
+    ('f', 'ㄝˊㄈㄨˋ'),
+    ('g', 'ㄐㄧˋ'),
+    ('h', 'ㄝˇㄑㄩˋ'),
+    ('i', 'ㄞˋ'),
+    ('j', 'ㄐㄟˋ'),
+    ('k', 'ㄎㄟˋ'),
+    ('l', 'ㄝˊㄛˋ'),
+    ('m', 'ㄝˊㄇㄨˋ'),
+    ('n', 'ㄣˉ'),
+    ('o', 'ㄡˉ'),
+    ('p', 'ㄆㄧˉ'),
+    ('q', 'ㄎㄧㄡˉ'),
+    ('r', 'ㄚˋ'),
+    ('s', 'ㄝˊㄙˋ'),
+    ('t', 'ㄊㄧˋ'),
+    ('u', 'ㄧㄡˉ'),
+    ('v', 'ㄨㄧˉ'),
+    ('w', 'ㄉㄚˋㄅㄨˋㄌㄧㄡˋ'),
+    ('x', 'ㄝˉㄎㄨˋㄙˋ'),
+    ('y', 'ㄨㄞˋ'),
+    ('z', 'ㄗㄟˋ')
+]]
+
+# List of (bopomofo, romaji) pairs:
+_bopomofo_to_romaji = [(re.compile('%s' % x[0]), x[1]) for x in [
+    ('ㄅㄛ', 'p⁼wo'),
+    ('ㄆㄛ', 'pʰwo'),
+    ('ㄇㄛ', 'mwo'),
+    ('ㄈㄛ', 'fwo'),
+    ('ㄅ', 'p⁼'),
+    ('ㄆ', 'pʰ'),
+    ('ㄇ', 'm'),
+    ('ㄈ', 'f'),
+    ('ㄉ', 't⁼'),
+    ('ㄊ', 'tʰ'),
+    ('ㄋ', 'n'),
+    ('ㄌ', 'l'),
+    ('ㄍ', 'k⁼'),
+    ('ㄎ', 'kʰ'),
+    ('ㄏ', 'h'),
+    ('ㄐ', 'ʧ⁼'),
+    ('ㄑ', 'ʧʰ'),
+    ('ㄒ', 'ʃ'),
+    ('ㄓ', 'ʦ`⁼'),
+    ('ㄔ', 'ʦ`ʰ'),
+    ('ㄕ', 's`'),
+    ('ㄖ', 'ɹ`'),
+    ('ㄗ', 'ʦ⁼'),
+    ('ㄘ', 'ʦʰ'),
+    ('ㄙ', 's'),
+    ('ㄚ', 'a'),
+    ('ㄛ', 'o'),
+    ('ㄜ', 'ə'),
+    ('ㄝ', 'e'),
+    ('ㄞ', 'ai'),
+    ('ㄟ', 'ei'),
+    ('ㄠ', 'au'),
+    ('ㄡ', 'ou'),
+    ('ㄧㄢ', 'yeNN'),
+    ('ㄢ', 'aNN'),
+    ('ㄧㄣ', 'iNN'),
+    ('ㄣ', 'əNN'),
+    ('ㄤ', 'aNg'),
+    ('ㄧㄥ', 'iNg'),
+    ('ㄨㄥ', 'uNg'),
+    ('ㄩㄥ', 'yuNg'),
+    ('ㄥ', 'əNg'),
+    ('ㄦ', 'əɻ'),
+    ('ㄧ', 'i'),
+    ('ㄨ', 'u'),
+    ('ㄩ', 'ɥ'),
+    ('ˉ', '→'),
+    ('ˊ', '↑'),
+    ('ˇ', '↓↑'),
+    ('ˋ', '↓'),
+    ('˙', ''),
+    ('，', ','),
+    ('。', '.'),
+    ('！', '!'),
+    ('？', '?'),
+    ('—', '-')
+]]
+
+# List of (romaji, ipa) pairs:
+_romaji_to_ipa = [(re.compile('%s' % x[0], re.IGNORECASE), x[1]) for x in [
+    ('ʃy', 'ʃ'),
+    ('ʧʰy', 'ʧʰ'),
+    ('ʧ⁼y', 'ʧ⁼'),
+    ('NN', 'n'),
+    ('Ng', 'ŋ'),
+    ('y', 'j'),
+    ('h', 'x')
+]]
+
+# List of (bopomofo, ipa) pairs:
+_bopomofo_to_ipa = [(re.compile('%s' % x[0]), x[1]) for x in [
+    ('ㄅㄛ', 'p⁼wo'),
+    ('ㄆㄛ', 'pʰwo'),
+    ('ㄇㄛ', 'mwo'),
+    ('ㄈㄛ', 'fwo'),
+    ('ㄅ', 'p⁼'),
+    ('ㄆ', 'pʰ'),
+    ('ㄇ', 'm'),
+    ('ㄈ', 'f'),
+    ('ㄉ', 't⁼'),
+    ('ㄊ', 'tʰ'),
+    ('ㄋ', 'n'),
+    ('ㄌ', 'l'),
+    ('ㄍ', 'k⁼'),
+    ('ㄎ', 'kʰ'),
+    ('ㄏ', 'x'),
+    ('ㄐ', 'tʃ⁼'),
+    ('ㄑ', 'tʃʰ'),
+    ('ㄒ', 'ʃ'),
+    ('ㄓ', 'ts`⁼'),
+    ('ㄔ', 'ts`ʰ'),
+    ('ㄕ', 's`'),
+    ('ㄖ', 'ɹ`'),
+    ('ㄗ', 'ts⁼'),
+    ('ㄘ', 'tsʰ'),
+    ('ㄙ', 's'),
+    ('ㄚ', 'a'),
+    ('ㄛ', 'o'),
+    ('ㄜ', 'ə'),
+    ('ㄝ', 'ɛ'),
+    ('ㄞ', 'aɪ'),
+    ('ㄟ', 'eɪ'),
+    ('ㄠ', 'ɑʊ'),
+    ('ㄡ', 'oʊ'),
+    ('ㄧㄢ', 'jɛn'),
+    ('ㄩㄢ', 'ɥæn'),
+    ('ㄢ', 'an'),
+    ('ㄧㄣ', 'in'),
+    ('ㄩㄣ', 'ɥn'),
+    ('ㄣ', 'ən'),
+    ('ㄤ', 'ɑŋ'),
+    ('ㄧㄥ', 'iŋ'),
+    ('ㄨㄥ', 'ʊŋ'),
+    ('ㄩㄥ', 'jʊŋ'),
+    ('ㄥ', 'əŋ'),
+    ('ㄦ', 'əɻ'),
+    ('ㄧ', 'i'),
+    ('ㄨ', 'u'),
+    ('ㄩ', 'ɥ'),
+    ('ˉ', '→'),
+    ('ˊ', '↑'),
+    ('ˇ', '↓↑'),
+    ('ˋ', '↓'),
+    ('˙', ''),
+    ('，', ','),
+    ('。', '.'),
+    ('！', '!'),
+    ('？', '?'),
+    ('—', '-')
+]]
+
+# List of (bopomofo, ipa2) pairs:
+_bopomofo_to_ipa2 = [(re.compile('%s' % x[0]), x[1]) for x in [
+    ('ㄅㄛ', 'pwo'),
+    ('ㄆㄛ', 'pʰwo'),
+    ('ㄇㄛ', 'mwo'),
+    ('ㄈㄛ', 'fwo'),
+    ('ㄅ', 'p'),
+    ('ㄆ', 'pʰ'),
+    ('ㄇ', 'm'),
+    ('ㄈ', 'f'),
+    ('ㄉ', 't'),
+    ('ㄊ', 'tʰ'),
+    ('ㄋ', 'n'),
+    ('ㄌ', 'l'),
+    ('ㄍ', 'k'),
+    ('ㄎ', 'kʰ'),
+    ('ㄏ', 'h'),
+    ('ㄐ', 'tɕ'),
+    ('ㄑ', 'tɕʰ'),
+    ('ㄒ', 'ɕ'),
+    ('ㄓ', 'tʂ'),
+    ('ㄔ', 'tʂʰ'),
+    ('ㄕ', 'ʂ'),
+    ('ㄖ', 'ɻ'),
+    ('ㄗ', 'ts'),
+    ('ㄘ', 'tsʰ'),
+    ('ㄙ', 's'),
+    ('ㄚ', 'a'),
+    ('ㄛ', 'o'),
+    ('ㄜ', 'ɤ'),
+    ('ㄝ', 'ɛ'),
+    ('ㄞ', 'aɪ'),
+    ('ㄟ', 'eɪ'),
+    ('ㄠ', 'ɑʊ'),
+    ('ㄡ', 'oʊ'),
+    ('ㄧㄢ', 'jɛn'),
+    ('ㄩㄢ', 'yæn'),
+    ('ㄢ', 'an'),
+    ('ㄧㄣ', 'in'),
+    ('ㄩㄣ', 'yn'),
+    ('ㄣ', 'ən'),
+    ('ㄤ', 'ɑŋ'),
+    ('ㄧㄥ', 'iŋ'),
+    ('ㄨㄥ', 'ʊŋ'),
+    ('ㄩㄥ', 'jʊŋ'),
+    ('ㄥ', 'ɤŋ'),
+    ('ㄦ', 'əɻ'),
+    ('ㄧ', 'i'),
+    ('ㄨ', 'u'),
+    ('ㄩ', 'y'),
+    ('ˉ', '˥'),
+    ('ˊ', '˧˥'),
+    ('ˇ', '˨˩˦'),
+    ('ˋ', '˥˩'),
+    ('˙', ''),
+    ('，', ','),
+    ('。', '.'),
+    ('！', '!'),
+    ('？', '?'),
+    ('—', '-')
+]]
+
+
+def number_to_chinese(text):
+    numbers = re.findall(r'\d+(?:\.?\d+)?', text)
+    for number in numbers:
+        text = text.replace(number, cn2an.an2cn(number), 1)
+    return text
+
+
+def chinese_to_bopomofo(text):
+    text = text.replace('、', '，').replace('；', '，').replace('：', '，')
+    words = jieba.lcut(text, cut_all=False)
+    text = ''
+    for word in words:
+        bopomofos = lazy_pinyin(word, BOPOMOFO)
+        if not re.search('[\u4e00-\u9fff]', word):
+            text += word
+            continue
+        for i in range(len(bopomofos)):
+            bopomofos[i] = re.sub(r'([\u3105-\u3129])$', r'\1ˉ', bopomofos[i])
+        if text != '':
+            text += ' '
+        text += ''.join(bopomofos)
+    return text
+
+
+def latin_to_bopomofo(text):
+    for regex, replacement in _latin_to_bopomofo:
+        text = re.sub(regex, replacement, text)
+    return text
+
+
+def bopomofo_to_romaji(text):
+    for regex, replacement in _bopomofo_to_romaji:
+        text = re.sub(regex, replacement, text)
+    return text
+
+
+def bopomofo_to_ipa(text):
+    for regex, replacement in _bopomofo_to_ipa:
+        text = re.sub(regex, replacement, text)
+    return text
+
+
+def bopomofo_to_ipa2(text):
+    for regex, replacement in _bopomofo_to_ipa2:
+        text = re.sub(regex, replacement, text)
+    return text
+
+
+def chinese_to_romaji(text):
+    text = number_to_chinese(text)
+    text = chinese_to_bopomofo(text)
+    text = latin_to_bopomofo(text)
+    text = bopomofo_to_romaji(text)
+    text = re.sub('i([aoe])', r'y\1', text)
+    text = re.sub('u([aoəe])', r'w\1', text)
+    text = re.sub('([ʦsɹ]`[⁼ʰ]?)([→↓↑ ]+|$)',
+                  r'\1ɹ`\2', text).replace('ɻ', 'ɹ`')
+    text = re.sub('([ʦs][⁼ʰ]?)([→↓↑ ]+|$)', r'\1ɹ\2', text)
+    return text
+
+
+def chinese_to_lazy_ipa(text):
+    text = chinese_to_romaji(text)
+    for regex, replacement in _romaji_to_ipa:
+        text = re.sub(regex, replacement, text)
+    return text
+
+
+def chinese_to_ipa(text):
+    text = number_to_chinese(text)
+    text = chinese_to_bopomofo(text)
+    text = latin_to_bopomofo(text)
+    text = bopomofo_to_ipa(text)
+    text = re.sub('i([aoe])', r'j\1', text)
+    text = re.sub('u([aoəe])', r'w\1', text)
+    text = re.sub('([sɹ]`[⁼ʰ]?)([→↓↑ ]+|$)',
+                  r'\1ɹ`\2', text).replace('ɻ', 'ɹ`')
+    text = re.sub('([s][⁼ʰ]?)([→↓↑ ]+|$)', r'\1ɹ\2', text)
+    return text
+
+
+def chinese_to_ipa2(text):
+    text = number_to_chinese(text)
+    text = chinese_to_bopomofo(text)
+    text = latin_to_bopomofo(text)
+    text = bopomofo_to_ipa2(text)
+    text = re.sub(r'i([aoe])', r'j\1', text)
+    text = re.sub(r'u([aoəe])', r'w\1', text)
+    text = re.sub(r'([ʂɹ]ʰ?)([˩˨˧˦˥ ]+|$)', r'\1ʅ\2', text)
+    text = re.sub(r'(sʰ?)([˩˨˧˦˥ ]+|$)', r'\1ɿ\2', text)
+    return text
+
+</code>
+
+## text/symbols.py
+
+<code>
+
+'''
+Defines the set of symbols used in text input to the model.
+'''
+
+# japanese_cleaners
+# _pad        = '_'
+# _punctuation = ',.!?-'
+# _letters = 'AEINOQUabdefghijkmnoprstuvwyzʃʧ↓↑ '
+
+
+'''# japanese_cleaners2
+_pad        = '_'
+_punctuation = ',.!?-~…'
+_letters = 'AEINOQUabdefghijkmnoprstuvwyzʃʧʦ↓↑ '
+'''
+
+
+'''# korean_cleaners
+_pad        = '_'
+_punctuation = ',.!?…~'
+_letters = 'ㄱㄴㄷㄹㅁㅂㅅㅇㅈㅊㅋㅌㅍㅎㄲㄸㅃㅆㅉㅏㅓㅗㅜㅡㅣㅐㅔ '
+'''
+
+'''# chinese_cleaners
+_pad        = '_'
+_punctuation = '，。！？—…'
+_letters = 'ㄅㄆㄇㄈㄉㄊㄋㄌㄍㄎㄏㄐㄑㄒㄓㄔㄕㄖㄗㄘㄙㄚㄛㄜㄝㄞㄟㄠㄡㄢㄣㄤㄥㄦㄧㄨㄩˉˊˇˋ˙ '
+'''
+
+# # zh_ja_mixture_cleaners
+# _pad        = '_'
+# _punctuation = ',.!?-~…'
+# _letters = 'AEINOQUabdefghijklmnoprstuvwyzʃʧʦɯɹəɥ⁼ʰ`→↓↑ '
+
+
+'''# sanskrit_cleaners
+_pad        = '_'
+_punctuation = '।'
+_letters = 'ँंःअआइईउऊऋएऐओऔकखगघङचछजझञटठडढणतथदधनपफबभमयरलळवशषसहऽािीुूृॄेैोौ्ॠॢ '
+'''
+
+'''# cjks_cleaners
+_pad        = '_'
+_punctuation = ',.!?-~…'
+_letters = 'NQabdefghijklmnopstuvwxyzʃʧʥʦɯɹəɥçɸɾβŋɦː⁼ʰ`^#*=→↓↑ '
+'''
+
+'''# thai_cleaners
+_pad        = '_'
+_punctuation = '.!? '
+_letters = 'กขฃคฆงจฉชซฌญฎฏฐฑฒณดตถทธนบปผฝพฟภมยรฤลวศษสหฬอฮฯะัาำิีึืุูเแโใไๅๆ็่้๊๋์'
+'''
+
+# # cjke_cleaners2
+_pad        = '_'
+_punctuation = ',.!?-~…'
+_letters = 'NQabdefghijklmnopstuvwxyzɑæʃʑçɯɪɔɛɹðəɫɥɸʊɾʒθβŋɦ⁼ʰ`^#*=ˈˌ→↓↑ '
+
+
+'''# shanghainese_cleaners
+_pad        = '_'
+_punctuation = ',.!?…'
+_letters = 'abdfghiklmnopstuvyzøŋȵɑɔɕəɤɦɪɿʑʔʰ̩̃ᴀᴇ15678 '
+'''
+
+'''# chinese_dialect_cleaners
+_pad        = '_'
+_punctuation = ',.!?~…─'
+_letters = '#Nabdefghijklmnoprstuvwxyzæçøŋœȵɐɑɒɓɔɕɗɘəɚɛɜɣɤɦɪɭɯɵɷɸɻɾɿʂʅʊʋʌʏʑʔʦʮʰʷˀː˥˦˧˨˩̥̩̃̚ᴀᴇ↑↓∅ⱼ '
+'''
+
+# Export all symbols:
+symbols = [_pad] + list(_punctuation) + list(_letters)
+
+# Special symbol ids
+SPACE_ID = symbols.index(" ")
+
+num_ja_tones = 1
+num_kr_tones = 1
+num_zh_tones = 6
+num_en_tones = 4
+
+language_tone_start_map = {
+    "ZH": 0,
+    "JP": num_zh_tones,
+    "EN": num_zh_tones + num_ja_tones,
+    'KR': num_zh_tones + num_ja_tones + num_en_tones,
+}
+</code>
+
+## transforms.py
+
+<code>
+
+import torch
+from torch.nn import functional as F
+
+import numpy as np
+
+
+DEFAULT_MIN_BIN_WIDTH = 1e-3
+DEFAULT_MIN_BIN_HEIGHT = 1e-3
+DEFAULT_MIN_DERIVATIVE = 1e-3
+
+
+def piecewise_rational_quadratic_transform(
+    inputs,
+    unnormalized_widths,
+    unnormalized_heights,
+    unnormalized_derivatives,
+    inverse=False,
+    tails=None,
+    tail_bound=1.0,
+    min_bin_width=DEFAULT_MIN_BIN_WIDTH,
+    min_bin_height=DEFAULT_MIN_BIN_HEIGHT,
+    min_derivative=DEFAULT_MIN_DERIVATIVE,
+):
+    if tails is None:
+        spline_fn = rational_quadratic_spline
+        spline_kwargs = {}
+    else:
+        spline_fn = unconstrained_rational_quadratic_spline
+        spline_kwargs = {"tails": tails, "tail_bound": tail_bound}
+
+    outputs, logabsdet = spline_fn(
+        inputs=inputs,
+        unnormalized_widths=unnormalized_widths,
+        unnormalized_heights=unnormalized_heights,
+        unnormalized_derivatives=unnormalized_derivatives,
+        inverse=inverse,
+        min_bin_width=min_bin_width,
+        min_bin_height=min_bin_height,
+        min_derivative=min_derivative,
+        **spline_kwargs
+    )
+    return outputs, logabsdet
+
+
+def searchsorted(bin_locations, inputs, eps=1e-6):
+    bin_locations[..., -1] += eps
+    return torch.sum(inputs[..., None] >= bin_locations, dim=-1) - 1
+
+
+def unconstrained_rational_quadratic_spline(
+    inputs,
+    unnormalized_widths,
+    unnormalized_heights,
+    unnormalized_derivatives,
+    inverse=False,
+    tails="linear",
+    tail_bound=1.0,
+    min_bin_width=DEFAULT_MIN_BIN_WIDTH,
+    min_bin_height=DEFAULT_MIN_BIN_HEIGHT,
+    min_derivative=DEFAULT_MIN_DERIVATIVE,
+):
+    inside_interval_mask = (inputs >= -tail_bound) & (inputs <= tail_bound)
+    outside_interval_mask = ~inside_interval_mask
+
+    outputs = torch.zeros_like(inputs)
+    logabsdet = torch.zeros_like(inputs)
+
+    if tails == "linear":
+        unnormalized_derivatives = F.pad(unnormalized_derivatives, pad=(1, 1))
+        constant = np.log(np.exp(1 - min_derivative) - 1)
+        unnormalized_derivatives[..., 0] = constant
+        unnormalized_derivatives[..., -1] = constant
+
+        outputs[outside_interval_mask] = inputs[outside_interval_mask]
+        logabsdet[outside_interval_mask] = 0
+    else:
+        raise RuntimeError("{} tails are not implemented.".format(tails))
+
+    (
+        outputs[inside_interval_mask],
+        logabsdet[inside_interval_mask],
+    ) = rational_quadratic_spline(
+        inputs=inputs[inside_interval_mask],
+        unnormalized_widths=unnormalized_widths[inside_interval_mask, :],
+        unnormalized_heights=unnormalized_heights[inside_interval_mask, :],
+        unnormalized_derivatives=unnormalized_derivatives[inside_interval_mask, :],
+        inverse=inverse,
+        left=-tail_bound,
+        right=tail_bound,
+        bottom=-tail_bound,
+        top=tail_bound,
+        min_bin_width=min_bin_width,
+        min_bin_height=min_bin_height,
+        min_derivative=min_derivative,
+    )
+
+    return outputs, logabsdet
+
+
+def rational_quadratic_spline(
+    inputs,
+    unnormalized_widths,
+    unnormalized_heights,
+    unnormalized_derivatives,
+    inverse=False,
+    left=0.0,
+    right=1.0,
+    bottom=0.0,
+    top=1.0,
+    min_bin_width=DEFAULT_MIN_BIN_WIDTH,
+    min_bin_height=DEFAULT_MIN_BIN_HEIGHT,
+    min_derivative=DEFAULT_MIN_DERIVATIVE,
+):
+    if torch.min(inputs) < left or torch.max(inputs) > right:
+        raise ValueError("Input to a transform is not within its domain")
+
+    num_bins = unnormalized_widths.shape[-1]
+
+    if min_bin_width * num_bins > 1.0:
+        raise ValueError("Minimal bin width too large for the number of bins")
+    if min_bin_height * num_bins > 1.0:
+        raise ValueError("Minimal bin height too large for the number of bins")
+
+    widths = F.softmax(unnormalized_widths, dim=-1)
+    widths = min_bin_width + (1 - min_bin_width * num_bins) * widths
+    cumwidths = torch.cumsum(widths, dim=-1)
+    cumwidths = F.pad(cumwidths, pad=(1, 0), mode="constant", value=0.0)
+    cumwidths = (right - left) * cumwidths + left
+    cumwidths[..., 0] = left
+    cumwidths[..., -1] = right
+    widths = cumwidths[..., 1:] - cumwidths[..., :-1]
+
+    derivatives = min_derivative + F.softplus(unnormalized_derivatives)
+
+    heights = F.softmax(unnormalized_heights, dim=-1)
+    heights = min_bin_height + (1 - min_bin_height * num_bins) * heights
+    cumheights = torch.cumsum(heights, dim=-1)
+    cumheights = F.pad(cumheights, pad=(1, 0), mode="constant", value=0.0)
+    cumheights = (top - bottom) * cumheights + bottom
+    cumheights[..., 0] = bottom
+    cumheights[..., -1] = top
+    heights = cumheights[..., 1:] - cumheights[..., :-1]
+
+    if inverse:
+        bin_idx = searchsorted(cumheights, inputs)[..., None]
+    else:
+        bin_idx = searchsorted(cumwidths, inputs)[..., None]
+
+    input_cumwidths = cumwidths.gather(-1, bin_idx)[..., 0]
+    input_bin_widths = widths.gather(-1, bin_idx)[..., 0]
+
+    input_cumheights = cumheights.gather(-1, bin_idx)[..., 0]
+    delta = heights / widths
+    input_delta = delta.gather(-1, bin_idx)[..., 0]
+
+    input_derivatives = derivatives.gather(-1, bin_idx)[..., 0]
+    input_derivatives_plus_one = derivatives[..., 1:].gather(-1, bin_idx)[..., 0]
+
+    input_heights = heights.gather(-1, bin_idx)[..., 0]
+
+    if inverse:
+        a = (inputs - input_cumheights) * (
+            input_derivatives + input_derivatives_plus_one - 2 * input_delta
+        ) + input_heights * (input_delta - input_derivatives)
+        b = input_heights * input_derivatives - (inputs - input_cumheights) * (
+            input_derivatives + input_derivatives_plus_one - 2 * input_delta
+        )
+        c = -input_delta * (inputs - input_cumheights)
+
+        discriminant = b.pow(2) - 4 * a * c
+        assert (discriminant >= 0).all()
+
+        root = (2 * c) / (-b - torch.sqrt(discriminant))
+        outputs = root * input_bin_widths + input_cumwidths
+
+        theta_one_minus_theta = root * (1 - root)
+        denominator = input_delta + (
+            (input_derivatives + input_derivatives_plus_one - 2 * input_delta)
+            * theta_one_minus_theta
+        )
+        derivative_numerator = input_delta.pow(2) * (
+            input_derivatives_plus_one * root.pow(2)
+            + 2 * input_delta * theta_one_minus_theta
+            + input_derivatives * (1 - root).pow(2)
+        )
+        logabsdet = torch.log(derivative_numerator) - 2 * torch.log(denominator)
+
+        return outputs, -logabsdet
+    else:
+        theta = (inputs - input_cumwidths) / input_bin_widths
+        theta_one_minus_theta = theta * (1 - theta)
+
+        numerator = input_heights * (
+            input_delta * theta.pow(2) + input_derivatives * theta_one_minus_theta
+        )
+        denominator = input_delta + (
+            (input_derivatives + input_derivatives_plus_one - 2 * input_delta)
+            * theta_one_minus_theta
+        )
+        outputs = input_cumheights + numerator / denominator
+
+        derivative_numerator = input_delta.pow(2) * (
+            input_derivatives_plus_one * theta.pow(2)
+            + 2 * input_delta * theta_one_minus_theta
+            + input_derivatives * (1 - theta).pow(2)
+        )
+        logabsdet = torch.log(derivative_numerator) - 2 * torch.log(denominator)
+
+        return outputs, logabsdet
+
+</code>
+
+## utils.py
+
+<code>
+
+import re
+import json
+import numpy as np
+
+
+def get_hparams_from_file(config_path):
+    with open(config_path, "r", encoding="utf-8") as f:
+        data = f.read()
+    config = json.loads(data)
+
+    hparams = HParams(**config)
+    return hparams
+
+class HParams:
+    def __init__(self, **kwargs):
+        for k, v in kwargs.items():
+            if type(v) == dict:
+                v = HParams(**v)
+            self[k] = v
+
+    def keys(self):
+        return self.__dict__.keys()
+
+    def items(self):
+        return self.__dict__.items()
+
+    def values(self):
+        return self.__dict__.values()
+
+    def __len__(self):
+        return len(self.__dict__)
+
+    def __getitem__(self, key):
+        return getattr(self, key)
+
+    def __setitem__(self, key, value):
+        return setattr(self, key, value)
+
+    def __contains__(self, key):
+        return key in self.__dict__
+
+    def __repr__(self):
+        return self.__dict__.__repr__()
+
+
+def string_to_bits(string, pad_len=8):
+    # Convert each character to its ASCII value
+    ascii_values = [ord(char) for char in string]
+    
+    # Convert ASCII values to binary representation
+    binary_values = [bin(value)[2:].zfill(8) for value in ascii_values]
+    
+    # Convert binary strings to integer arrays
+    bit_arrays = [[int(bit) for bit in binary] for binary in binary_values]
+    
+    # Convert list of arrays to NumPy array
+    numpy_array = np.array(bit_arrays)
+    numpy_array_full = np.zeros((pad_len, 8), dtype=numpy_array.dtype)
+    numpy_array_full[:, 2] = 1
+    max_len = min(pad_len, len(numpy_array))
+    numpy_array_full[:max_len] = numpy_array[:max_len]
+    return numpy_array_full
+
+
+def bits_to_string(bits_array):
+    # Convert each row of the array to a binary string
+    binary_values = [''.join(str(bit) for bit in row) for row in bits_array]
+    
+    # Convert binary strings to ASCII values
+    ascii_values = [int(binary, 2) for binary in binary_values]
+    
+    # Convert ASCII values to characters
+    output_string = ''.join(chr(value) for value in ascii_values)
+    
+    return output_string
+
+
+def split_sentence(text, min_len=10, language_str='[EN]'):
+    if language_str in ['EN']:
+        sentences = split_sentences_latin(text, min_len=min_len)
+    else:
+        sentences = split_sentences_zh(text, min_len=min_len)
+    return sentences
+
+def split_sentences_latin(text, min_len=10):
+    """Split Long sentences into list of short ones
+
+    Args:
+        text: Input sentences.
+
+    Returns:
+        List[str]: list of output sentences.
+        :param text:
+        :param min_len:
+    """
+    # deal with dirty sentences
+    text = re.sub('[。！？；]', '.', text)
+    text = re.sub('[，]', ',', text)
+    text = re.sub('[“”]', '"', text)
+    text = re.sub('[‘’]', "'", text)
+    text = re.sub(r"[\<\>\(\)\[\]\"\«\»]+", "", text)
+    text = re.sub('[\n\t ]+', ' ', text)
+    text = re.sub('([,.!?;])', r'\1 $#!', text)
+    # split
+    sentences = [s.strip() for s in text.split('$#!')]
+    if len(sentences[-1]) == 0: del sentences[-1]
+
+    new_sentences = []
+    new_sent = []
+    count_len = 0
+    for ind, sent in enumerate(sentences):
+        # print(sent)
+        new_sent.append(sent)
+        count_len += len(sent.split(" "))
+        if count_len > min_len or ind == len(sentences) - 1:
+            count_len = 0
+            new_sentences.append(' '.join(new_sent))
+            new_sent = []
+    return merge_short_sentences_latin(new_sentences)
+
+
+def merge_short_sentences_latin(sens):
+    """Avoid short sentences by merging them with the following sentence.
+
+    Args:
+        List[str]: list of input sentences.
+
+    Returns:
+        List[str]: list of output sentences.
+    """
+    sens_out = []
+    for s in sens:
+        # If the previous sentence is too short, merge them with
+        # the current sentence.
+        if len(sens_out) > 0 and len(sens_out[-1].split(" ")) <= 2:
+            sens_out[-1] = sens_out[-1] + " " + s
+        else:
+            sens_out.append(s)
+    try:
+        if len(sens_out[-1].split(" ")) <= 2:
+            sens_out[-2] = sens_out[-2] + " " + sens_out[-1]
+            sens_out.pop(-1)
+    except:
+        pass
+    return sens_out
+
+def split_sentences_zh(text, min_len=10):
+    text = re.sub('[。！？；]', '.', text)
+    text = re.sub('[，]', ',', text)
+    # 将文本中的换行符、空格和制表符替换为空格
+    text = re.sub('[\n\t ]+', ' ', text)
+    # 在标点符号后添加一个空格
+    text = re.sub('([,.!?;])', r'\1 $#!', text)
+    # 分隔句子并去除前后空格
+    # sentences = [s.strip() for s in re.split('(。|！|？|；)', text)]
+    sentences = [s.strip() for s in text.split('$#!')]
+    if len(sentences[-1]) == 0: del sentences[-1]
+
+    new_sentences = []
+    new_sent = []
+    count_len = 0
+    for ind, sent in enumerate(sentences):
+        new_sent.append(sent)
+        count_len += len(sent)
+        if count_len > min_len or ind == len(sentences) - 1:
+            count_len = 0
+            new_sentences.append(' '.join(new_sent))
+            new_sent = []
+    return merge_short_sentences_zh(new_sentences)
+
+
+def merge_short_sentences_zh(sens):
+    # return sens
+    """Avoid short sentences by merging them with the following sentence.
+
+    Args:
+        List[str]: list of input sentences.
+
+    Returns:
+        List[str]: list of output sentences.
+    """
+    sens_out = []
+    for s in sens:
+        # If the previous sentense is too short, merge them with
+        # the current sentence.
+        if len(sens_out) > 0 and len(sens_out[-1]) <= 2:
+            sens_out[-1] = sens_out[-1] + " " + s
+        else:
+            sens_out.append(s)
+    try:
+        if len(sens_out[-1]) <= 2:
+            sens_out[-2] = sens_out[-2] + " " + sens_out[-1]
+            sens_out.pop(-1)
+    except:
+        pass
+    return sens_out
+</code>
+
+
+
+
+
+
+I already have inplace a streaming model/script. This project helps me to stream the audio generated by the openvoice using websocket. The code:
+## __init__.py
+
+<code>
+
+
+</code>
+
+## core/__init__.py
+
+<code>
+
+
+</code>
+
+## core/libs/__init__.py
+
+<code>
+
+from openvoice_streaming_server.core.libs.model import StreamingBaseSpeakerTTS
+
+__all__ = ['StreamingBaseSpeakerTTS']
+
+</code>
+
+## core/libs/model.py
+
+<code>
+
+import re
+import torch
+
+from openvoice.api import BaseSpeakerTTS
+
+
+class StreamingBaseSpeakerTTS(BaseSpeakerTTS):
+    language_marks = {
+        "english": "EN",
+        "chinese": "ZH",
+    }
+
+    async def generate_audio_chunks(self, text, speaker, language='English', speed=1.0):
+        mark = self.language_marks.get(language.lower(), None)
+        assert mark is not None, f"language {language} is not supported"
+
+        texts = self.split_sentences_into_pieces(text, mark)
+
+        for t in texts:
+            t = re.sub(r'([a-z])([A-Z])', r'\1 \2', t)
+            t = f'[{mark}]{t}[{mark}]'
+            stn_tst = self.get_text(t, self.hps, False)
+            device = self.device
+            speaker_id = self.hps.speakers[speaker]
+            with torch.no_grad():
+                x_tst = stn_tst.unsqueeze(0).to(device)
+                x_tst_lengths = torch.LongTensor([stn_tst.size(0)]).to(device)
+                sid = torch.LongTensor([speaker_id]).to(device)
+                audio = self.model.infer(x_tst, x_tst_lengths, sid=sid, noise_scale=0.667, noise_scale_w=0.6,
+                                         length_scale=1.0 / speed)[0][0, 0].data.cpu().float().numpy()
+                yield audio
+
+    async def tts_stream(self, text, speaker, language='English', speed=1.0):
+        async for audio_chunk in self.generate_audio_chunks(text, speaker, language, speed):
+            yield audio_chunk.tobytes()
+
+</code>
+
+## core/schemas/__init__.py
+
+<code>
+
+from openvoice_streaming_server.core.schemas.synthesize_schema import SynthesisRequest, SynthesisResponse
+
+__all__ = ["SynthesisRequest", "SynthesisResponse"]
+
+</code>
+
+## core/schemas/synthesize_schema.py
+
+<code>
+
+from pydantic import BaseModel
+from typing import Optional, Text
+
+
+class SynthesisRequest(BaseModel):
+    text: Text
+    speaker: Optional[Text] = 'default'
+    language: Optional[Text] = 'english'
+    speed: Optional[float] = 1.0
+
+
+class SynthesisResponse(BaseModel):
+    audio_chunk: bytes
+
+</code>
+
+## core/settings.py
+
+<code>
+
+from pydantic_settings import BaseSettings
+
+
+class Settings(BaseSettings):
+    HOST: str = "127.0.0.1"
+    PORT: int = 8000
+    DEBUG: bool = True
+    LOG_LEVEL: str = "info"
+
+    class Config:
+        env_file = ".env"
+
+</code>
+
+## main.py
+
+<code>
+
+from fastapi import FastAPI
+
+from openvoice_streaming_server.v1.api import api_router
+
+app = FastAPI()
+
+# Include API routes
+app.include_router(api_router, prefix="/v1")
+
+</code>
+
+## v1/__init__.py
+
+<code>
+
+
+</code>
+
+## v1/api.py
+
+<code>
+
+from fastapi import APIRouter
+
+from openvoice_streaming_server.v1.endpoints import synthesize
+
+router = APIRouter()
+router.include_router(synthesize.router)
+api_router = APIRouter()
+api_router.include_router(router, prefix="/api")
+
+</code>
+
+## v1/endpoints/__init__.py
+
+<code>
+
+
+</code>
+
+## v1/endpoints/synthesize.py
+
+<code>
+
+import logging
+import torch
+from fastapi import APIRouter, WebSocket, WebSocketDisconnect
+from starlette.websockets import WebSocketState
+
+from openvoice_streaming_server.core.libs import StreamingBaseSpeakerTTS
+from openvoice_streaming_server.core.schemas import SynthesisRequest, SynthesisResponse
+
+router = APIRouter()
+
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
+formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+stream_handler = logging.StreamHandler()
+stream_handler.setFormatter(formatter)
+logger.addHandler(stream_handler)
+
+
+async def send_audio_stream(websocket: WebSocket, audio_stream):
+    try:
+        async for audio_chunk in audio_stream:
+            response = SynthesisResponse(audio_chunk=audio_chunk)
+            await websocket.send_bytes(response.audio_chunk)
+    except WebSocketDisconnect:
+        pass
+
+
+class WebSocketHandler:
+    def __init__(self, tts_model):
+        self.model = tts_model
+        self.connections = set()
+
+    async def connect(self, websocket: WebSocket):
+        await websocket.accept()
+        self.connections.add(websocket)
+
+    async def disconnect(self, websocket: WebSocket):
+        if websocket.client_state != WebSocketState.DISCONNECTED:
+            await websocket.close()
+            self.connections.remove(websocket)
+
+    async def handle_websocket(self, websocket: WebSocket):
+        await self.connect(websocket)
+        try:
+            while True:
+                data = await websocket.receive_text()
+                request = SynthesisRequest.parse_raw(data)
+                if request.text == "":
+                    await self.disconnect(websocket)
+                    return
+                text = request.text
+                speaker = request.speaker
+                language = request.language
+                speed = request.speed
+                logger.info(f"Received text: {text}, speaker: {speaker}, language: {language}, speed: {speed}")
+                audio_stream = self.model.tts_stream(text, speaker, language, speed)
+                await send_audio_stream(websocket, audio_stream)
+        except WebSocketDisconnect:
+            await self.disconnect(websocket)
+        except Exception as e:
+            logger.error(f"Error during text synthesis: {e}")
+            await self.disconnect(websocket)
+
+
+en_checkpoint_base = "../resources/checkpoints/base_speakers/EN"
+device = "cuda:0" if torch.cuda.is_available() else "cpu"
+
+# Load models and resources
+model = StreamingBaseSpeakerTTS(f'{en_checkpoint_base}/config.json', device=device)
+model.load_ckpt(f'{en_checkpoint_base}/checkpoint.pth')
+
+handler = WebSocketHandler(model)
+
+
+@router.websocket("/synthesize")
+async def synthesize(websocket: WebSocket):
+    await handler.handle_websocket(websocket)
+
+</code>
+
+
+ This is the code for my current project. Get to know the code and I will tell you what to do next. Do you understand?
