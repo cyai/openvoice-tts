@@ -38,7 +38,7 @@ class WebSocketHandler:
         #     "../resources/checkpoints/base_speakers/EN/en_default_se.pth"
         # ).to(self.model.device)
         source_speaker = "../resources/Source.mp3"
-        refrence_speaker = "../resources/Abdulla.mp3"
+        refrence_speaker = "../resources/Source.mp3"
         self.source_se, audio_name = se_extractor.get_se(
             source_speaker, self.clone_model, vad=True
         )
@@ -73,16 +73,16 @@ class WebSocketHandler:
                     f"Received text: {text}, speaker: {speaker}, language: {language}, speed: {speed}"
                 )
 
-                audio_stream = self.model.tts_stream(text, speaker, language, speed)
-                # async for audio_chunk in self.model.generate_audio_chunks(
-                #     text, speaker, language, speed
-                # ):
-                #     cloned_audio_stream = self.clone_model.tts_stream(
-                #         audio_chunk, self.source_se, self.target_se
-                #     )
-                #     await send_audio_stream(websocket, cloned_audio_stream)
+                # audio_stream = self.model.tts_stream(text, speaker, language, speed)
+                async for audio_chunk in self.model.generate_audio_chunks(
+                    text, speaker, language, speed
+                ):
+                    cloned_audio_stream = self.clone_model.tts_stream(
+                        audio_chunk, self.source_se, self.target_se
+                    )
+                    await send_audio_stream(websocket, cloned_audio_stream)
 
-                await send_audio_stream(websocket, audio_stream)
+                # await send_audio_stream(websocket, audio_stream)
         except WebSocketDisconnect:
             await self.disconnect(websocket)
         except Exception as e:
