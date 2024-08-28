@@ -40,7 +40,7 @@ class WebSocketHandler:
         source_speaker = "../resources/Source.mp3"
         refrence_speaker = "../resources/Abdulla.mp3"
         self.source_se, audio_name = se_extractor.get_se(
-            source_speaker, self.model, vad=True
+            source_speaker, self.clone_model, vad=True
         )
         self.target_se, audio_name = se_extractor.get_se(
             refrence_speaker, self.clone_model, vad=True
