@@ -66,14 +66,16 @@ class WebSocketHandler:
                 logger.info(
                     f"Received text: {text}, speaker: {speaker}, language: {language}, speed: {speed}"
                 )
-                audio_stream = await self.model.tts_stream(
-                    text, speaker, language, speed
-                )
-                cloned_audio_stream = self.clone_model.tts_stream(
-                    audio_stream, self.source_se, self.target_se
-                )
 
-                await send_audio_stream(websocket, cloned_audio_stream)
+                for audio_chunk in self.model.tts_stream(
+                    text, speaker, language, speed
+                ):
+                    cloned_audio_stream = self.clone_model.tts_stream(
+                        audio_chunk, self.source_se, self.target_se
+                    )
+                    await send_audio_stream(websocket, cloned_audio_stream)
+
+                # await send_audio_stream(websocket, cloned_audio_stream)
         except WebSocketDisconnect:
             await self.disconnect(websocket)
         except Exception as e:
