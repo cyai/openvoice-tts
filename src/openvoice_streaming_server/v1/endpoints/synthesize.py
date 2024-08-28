@@ -38,7 +38,7 @@ class WebSocketHandler:
         #     "../resources/checkpoints/base_speakers/EN/en_default_se.pth"
         # ).to(self.model.device)
         source_speaker = "../resources/Source.mp3"
-        refrence_speaker = "../resources/Source.mp3"
+        refrence_speaker = "../resources/Abdulla.mp3"
         self.source_se, audio_name = se_extractor.get_se(
             source_speaker, self.clone_model, vad=True
         )
