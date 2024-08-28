@@ -93,10 +93,13 @@ class StreamingCloneSpeakerTTS(ToneColorConverter):
             yield audio
 
     async def tts_stream(self, audio_data, src_se, tgt_se, output_path=None):
-        async for audio_chunk in self.generate_audio_chunks(
-            audio_data=audio_data,
-            src_se=src_se,
-            tgt_se=tgt_se,
-            output_path=output_path,
-        ):
-            yield audio_chunk.tobytes()
+        try:
+            async for audio_chunk in self.generate_audio_chunks(
+                audio_data=audio_data,
+                src_se=src_se,
+                tgt_se=tgt_se,
+                output_path=output_path,
+            ):
+                yield audio_chunk.tobytes()
+        except Exception as e:
+            print("Error in cloned tts_stream", e)
