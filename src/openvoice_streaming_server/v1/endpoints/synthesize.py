@@ -37,9 +37,10 @@ class WebSocketHandler:
         # self.source_se = torch.load(
         #     "../resources/checkpoints/base_speakers/EN/en_default_se.pth"
         # ).to(self.model.device)
+        source_speaker = "../resources/Source.mp3"
         refrence_speaker = "../resources/Abdulla.mp3"
         self.source_se, audio_name = se_extractor.get_se(
-            refrence_speaker, self.model, vad=True
+            source_speaker, self.model, vad=True
         )
         self.target_se, audio_name = se_extractor.get_se(
             refrence_speaker, self.clone_model, vad=True
@@ -72,6 +73,9 @@ class WebSocketHandler:
                     f"Received text: {text}, speaker: {speaker}, language: {language}, speed: {speed}"
                 )
 
+                # cloned_audio_stream = self.clone_model.tts_stream(
+                #     text, speaker, language, speed
+                # )
                 async for audio_chunk in self.model.generate_audio_chunks(
                     text, speaker, language, speed
                 ):
