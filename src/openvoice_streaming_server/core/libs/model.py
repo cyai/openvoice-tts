@@ -68,7 +68,7 @@ class StreamingCloneSpeakerTTS(ToneColorConverter):
         hps = self.hps
         # load audio
         # audio, sample_rate = librosa.load(audio_data, sr=hps.data.sampling_rate)
-        audio = torch.tensor(audio).float()
+        audio = torch.tensor(audio_data).float()
 
         with torch.no_grad():
             y = torch.FloatTensor(audio).to(self.device)
