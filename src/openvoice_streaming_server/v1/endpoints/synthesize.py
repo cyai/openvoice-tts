@@ -2,10 +2,12 @@ import logging
 import torch
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 from starlette.websockets import WebSocketState
+from MeloTTS.melo.api import TTS
 
 from openvoice_streaming_server.core.libs import (
     StreamingBaseSpeakerTTS,
     StreamingCloneSpeakerTTS,
+    StreamingMeloSpeakerTTS,
 )
 from openvoice_streaming_server.core.schemas import SynthesisRequest, SynthesisResponse
 from openvoice import se_extractor
@@ -30,7 +32,7 @@ async def send_audio_stream(websocket: WebSocket, audio_stream):
 
 
 class WebSocketHandler:
-    def __init__(self, tts_model, clone_model):
+    def __init__(self, tts_model, clone_model, melo_model, device):
         self.model = tts_model
         self.clone_model = clone_model
         self.connections = set()
@@ -44,6 +46,10 @@ class WebSocketHandler:
         )
         self.target_se, audio_name = se_extractor.get_se(
             refrence_speaker, self.clone_model, vad=True
+        )
+        self.melo_model = melo_model
+        self.melo_source_se = torch.load(
+            "checkpoints_v2/base_speakers/ses/en-india.pth.pth", map_location=device
         )
 
     async def connect(self, websocket: WebSocket):
@@ -89,6 +95,34 @@ class WebSocketHandler:
             logger.error(f"Error during text synthesis: {e}")
             await self.disconnect(websocket)
 
+    async def melo_handle_websocket(self, websocket: WebSocket):
+        await self.connect(websocket)
+        try:
+            while True:
+                data = await websocket.receive_text()
+                request = SynthesisRequest.parse_raw(data)
+                if request.text == "":
+                    await self.disconnect(websocket)
+                    return
+                text = request.text
+                speaker = request.speaker
+                language = request.language
+                speed = request.speed
+                logger.info(
+                    f"Received text: {text}, speaker: {speaker}, language: {language}, speed: {speed}"
+                )
+
+                audio_stream = self.melo_model.tts_stream(
+                    text, speaker, language, speed
+                )
+                await send_audio_stream(websocket, audio_stream)
+
+        except WebSocketDisconnect:
+            await self.disconnect(websocket)
+        except Exception as e:
+            logger.error(f"Error during text synthesis: {e}")
+            await self.disconnect(websocket)
+
 
 en_checkpoint_base = "../resources/checkpoints/base_speakers/EN"
 converter_checkpoint = "../resources/checkpoints/converter"
@@ -99,10 +133,11 @@ clone_model = StreamingCloneSpeakerTTS(
     f"{converter_checkpoint}/config.json", device=device
 )
 model = StreamingBaseSpeakerTTS(f"{en_checkpoint_base}/config.json", device=device)
+melo_model = StreamingMeloSpeakerTTS(language="EN_NEWEST", device=device)
 model.load_ckpt(f"{en_checkpoint_base}/checkpoint.pth")
 clone_model.load_ckpt(f"{converter_checkpoint}/checkpoint.pth")
 
-handler = WebSocketHandler(model, clone_model)
+handler = WebSocketHandler(model, clone_model, melo_model, device)
 
 
 @router.websocket("/synthesize")
