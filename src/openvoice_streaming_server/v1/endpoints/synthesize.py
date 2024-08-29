@@ -52,7 +52,7 @@ class WebSocketHandler:
             "../resources/checkpoints_v2/base_speakers/ses/en-india.pth",
             map_location=device,
         )
-        self.speaker_ids = self.model.hps.data.spk2id
+        # self.speaker_ids = self.model.hps.data.spk2id
 
     async def connect(self, websocket: WebSocket):
         await websocket.accept()
@@ -121,7 +121,7 @@ class WebSocketHandler:
 
                 async for audio_chunk in self.melo_model.generate_audio_chunks(
                     text=text,
-                    speaker_id=self.speaker_ids["en-india"],
+                    speaker_id=2,  # "spk2id": { "EN-US": 0, "EN-BR": 1,"EN-INDIA": 2, "EN-AU": 4}
                 ):
                     cloned_audio_stream = self.clone_model.tts_stream(
                         audio_chunk, self.melo_source_se, self.target_se
