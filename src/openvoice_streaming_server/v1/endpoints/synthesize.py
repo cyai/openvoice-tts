@@ -49,7 +49,8 @@ class WebSocketHandler:
         )
         self.melo_model = melo_model
         self.melo_source_se = torch.load(
-            "checkpoints_v2/base_speakers/ses/en-india.pth.pth", map_location=device
+            "../resources/checkpoints_v2/base_speakers/ses/en-india.pth.pth",
+            map_location=device,
         )
         self.speaker_ids = self.model.hps.data.spk2id
 
