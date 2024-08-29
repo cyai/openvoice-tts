@@ -9,13 +9,16 @@ from . import punctuation, symbols
 
 
 from num2words import num2words
-from melo.text.ko_dictionary import english_dictionary, etc_dictionary
+from MeloTTS.melo.text.ko_dictionary import english_dictionary, etc_dictionary
 from anyascii import anyascii
 from jamo import hangul_to_jamo
 
+
 def normalize(text):
     text = text.strip()
-    text = re.sub("[⺀-⺙⺛-⻳⼀-⿕々〇〡-〩〸-〺〻㐀-䶵一-鿃豈-鶴侮-頻並-龎]", "", text)
+    text = re.sub(
+        "[⺀-⺙⺛-⻳⼀-⿕々〇〡-〩〸-〺〻㐀-䶵一-鿃豈-鶴侮-頻並-龎]", "", text
+    )
     text = normalize_with_dictionary(text, etc_dictionary)
     text = normalize_english(text)
     text = text.lower()
@@ -41,6 +44,8 @@ def normalize_english(text):
 
 
 g2p_kr = None
+
+
 def korean_text_to_phonemes(text, character: str = "hangeul") -> str:
     """
 
@@ -60,6 +65,7 @@ def korean_text_to_phonemes(text, character: str = "hangeul") -> str:
 
     if character == "english":
         from anyascii import anyascii
+
         text = normalize(text)
         text = g2p_kr(text)
         text = anyascii(text)
@@ -69,6 +75,7 @@ def korean_text_to_phonemes(text, character: str = "hangeul") -> str:
     text = g2p_kr(text)
     text = list(hangul_to_jamo(text))  # '하늘' --> ['ᄒ', 'ᅡ', 'ᄂ', 'ᅳ', 'ᆯ']
     return "".join(text)
+
 
 def text_normalize(text):
     # res = unicodedata.normalize("NFKC", text)
@@ -88,11 +95,11 @@ def distribute_phone(n_phone, n_word):
     return phones_per_word
 
 
-
 # tokenizer = AutoTokenizer.from_pretrained('cl-tohoku/bert-base-japanese-v3')
 
-model_id = 'kykim/bert-kor-base'
+model_id = "kykim/bert-kor-base"
 tokenizer = AutoTokenizer.from_pretrained(model_id)
+
 
 def g2p(norm_text):
     tokenized = tokenizer.tokenize(norm_text)
@@ -108,8 +115,8 @@ def g2p(norm_text):
         text = ""
         for ch in group:
             text += ch
-        if text == '[UNK]':
-            phs += ['_']
+        if text == "[UNK]":
+            phs += ["_"]
             word2ph += [1]
             continue
         elif text in punctuation:
@@ -134,29 +141,39 @@ def g2p(norm_text):
         phs += phonemes
     phones = ["_"] + phs + ["_"]
     tones = [0 for i in phones]
-    word2ph =  [1] + word2ph + [1]
+    word2ph = [1] + word2ph + [1]
     assert len(word2ph) == len(tokenized) + 2
     return phones, tones, word2ph
 
-def get_bert_feature(text, word2ph, device='cuda'):
+
+def get_bert_feature(text, word2ph, device="cuda"):
     from . import japanese_bert
-    return japanese_bert.get_bert_feature(text, word2ph, device=device, model_id=model_id)
+
+    return japanese_bert.get_bert_feature(
+        text, word2ph, device=device, model_id=model_id
+    )
 
 
 if __name__ == "__main__":
     # tokenizer = AutoTokenizer.from_pretrained("./bert/bert-base-japanese-v3")
     from text.symbols import symbols
+
     text = "전 제 일의 가치와 폰타인 대중들이 한 일의 의미를 잘 압니다. 앞으로도 전 제 일에 자부심을 갖고 살아갈 겁니다"
     import json
 
     # genshin_data = json.load(open('/data/zwl/workspace/StarRail_Datasets/Index & Scripts/Index/1.3/Korean.json'))
-    genshin_data = json.load(open('/data/zwl/workspace/Genshin_Datasets/Index & Script/AI Hobbyist Version/Index/4.1/KR_output.json'))
+    genshin_data = json.load(
+        open(
+            "/data/zwl/workspace/Genshin_Datasets/Index & Script/AI Hobbyist Version/Index/4.1/KR_output.json"
+        )
+    )
     from tqdm import tqdm
+
     new_symbols = []
     for key, item in tqdm(genshin_data.items()):
-        texts = item.get('voiceContent', '')
+        texts = item.get("voiceContent", "")
         if isinstance(texts, list):
-            texts = ','.join(texts)
+            texts = ",".join(texts)
         if texts is None:
             continue
         if len(texts) == 0:
@@ -165,16 +182,17 @@ if __name__ == "__main__":
         text = text_normalize(text)
         phones, tones, word2ph = g2p(text)
         bert = get_bert_feature(text, word2ph)
-        import  pdb; pdb.set_trace()
+        import pdb
+
+        pdb.set_trace()
         for ph in phones:
             if ph not in symbols and ph not in new_symbols:
                 new_symbols.append(ph)
-                print('update!, now symbols:')
+                print("update!, now symbols:")
                 print(new_symbols)
-                with open('korean_symbol.txt', 'w') as f:
-                    f.write(f'{new_symbols}')
+                with open("korean_symbol.txt", "w") as f:
+                    f.write(f"{new_symbols}")
 
-        
 
 # if __name__ == '__main__':
 #     from pykakasi import kakasi
