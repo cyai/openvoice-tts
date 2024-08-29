@@ -114,19 +114,20 @@ class WebSocketHandler:
                     f"Received text: {text}, speaker: {speaker}, language: {language}, speed: {speed}"
                 )
 
-                # audio_stream = self.melo_model.tts_stream(
-                #     text, speaker, language, speed
-                # )
-                # await send_audio_stream(websocket, audio_stream)
-
-                async for audio_chunk in self.melo_model.generate_audio_chunks(
+                audio_stream = self.melo_model.tts_stream(
                     text=text,
                     speaker_id=2,  # "spk2id": { "EN-US": 0, "EN-BR": 1,"EN-INDIA": 2, "EN-AU": 4}
-                ):
-                    cloned_audio_stream = self.clone_model.tts_stream(
-                        audio_chunk, self.melo_source_se, self.target_se
-                    )
-                    await send_audio_stream(websocket, cloned_audio_stream)
+                )
+                await send_audio_stream(websocket, audio_stream)
+
+                # async for audio_chunk in self.melo_model.generate_audio_chunks(
+                #     text=text,
+                #     speaker_id=2,  # "spk2id": { "EN-US": 0, "EN-BR": 1,"EN-INDIA": 2, "EN-AU": 4}
+                # ):
+                #     cloned_audio_stream = self.clone_model.tts_stream(
+                #         audio_chunk, self.melo_source_se, self.target_se
+                #     )
+                #     await send_audio_stream(websocket, cloned_audio_stream)
 
         except WebSocketDisconnect:
             await self.disconnect(websocket)
