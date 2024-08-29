@@ -144,7 +144,7 @@ clone_model = StreamingCloneSpeakerTTS(
     f"{converter_checkpoint}/config.json", device=device
 )
 model = StreamingBaseSpeakerTTS(f"{en_checkpoint_base}/config.json", device=device)
-melo_model = StreamingMeloSpeakerTTS(language="EN_NEWEST", device=device)
+melo_model = StreamingMeloSpeakerTTS(language="EN_V2", device=device)
 model.load_ckpt(f"{en_checkpoint_base}/checkpoint.pth")
 clone_model.load_ckpt(f"{converter_checkpoint}/checkpoint.pth")
 
