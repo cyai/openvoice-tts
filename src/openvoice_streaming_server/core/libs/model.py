@@ -119,13 +119,11 @@ class StreamingMeloSpeakerTTS(TTS):
         text,
         speaker_id,
         language="English",
-        output_path=None,
         sdp_ratio=0.2,
         noise_scale=0.6,
         noise_scale_w=0.8,
         speed=1.0,
         pbar=None,
-        format=None,
         position=None,
         quiet=False,
     ):
